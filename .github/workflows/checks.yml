@@ -16,6 +16,7 @@ name: Checks
 # system setup. `-p innertube -p listen-protocol` is the subset that builds on a bare runner.
 
 on:
+  workflow_dispatch:
   push:
     branches: [master, dev]
   pull_request:
