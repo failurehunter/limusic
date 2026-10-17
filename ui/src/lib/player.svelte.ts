@@ -1539,6 +1539,7 @@ export function initApp(mini = false): () => void {
 				repeat: q.repeat,
 				sourceName: q.sourceName,
 				sourceId: q.sourceId,
+				radio: q.radio,
 				prevTrack: q.prevTrack
 			};
 		}),
