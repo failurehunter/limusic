@@ -457,6 +457,7 @@ impl QueueState {
         self.shuffle_orig = prev.shuffle_orig;
         self.radio_seed = prev.radio_seed;
         self.radio_cont = prev.radio_cont;
+        self.radio_fails = 0; // the count belonged to the queue that replaced this one
         self.source_name = prev.source_name;
         self.source_id = prev.source_id;
         self.radio = prev.radio;
@@ -1351,6 +1352,8 @@ impl AppState {
             q.radio_cont = None;
             q.source_id = None;
             q.radio = false;
+            // A new queue has no failed windows behind it.
+            q.radio_fails = 0;
             // Hold off the autoplay early trigger `start_current` is about to spawn: this queue is
             // one track long, so it would fetch the very radio being hydrated below (#255).
             q.hydrating = (!no_radio).then_some(gen);
@@ -1401,6 +1404,8 @@ impl AppState {
                 if next.items.len() > 1 {
                     q.radio_seed = Some(radio_id.clone());
                     q.radio = true;
+                    // A radio installed now starts with a clean count.
+                    q.radio_fails = 0;
                     // Only a panel may say the radio ended. An answer without one is not about a
                     // radio, and the radio is not over: the first top-up asks from the seed.
                     q.radio_cont = radio_state(
@@ -1547,6 +1552,7 @@ impl AppState {
             let (flagged, token) = radio_install(radio, q.radio_seed.as_deref());
             q.radio = flagged;
             q.radio_cont = token;
+            q.radio_fails = 0; // a new queue has no failed windows behind it
             q.source_name = source_name;
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
             if keep_shuffled {
@@ -3108,14 +3114,6 @@ impl AppState {
         apply_failed_window(&mut q, top_up, seed, from_token, refused);
     }
 
-    /// A window came: whatever was wrong with the last ones is over.
-    async fn clear_failed_windows(&self, gen: u64) {
-        let mut q = self.queue.lock().await;
-        if self.generation.load(Ordering::SeqCst) == gen {
-            q.radio_fails = 0;
-        }
-    }
-
     /// Whether the queue is set to Repeat One. A radio under Repeat One has no next track to
     /// continue into once it has ended, and the Skip used to start the queue over.
     async fn repeats_one(&self) -> bool {
@@ -3188,8 +3186,6 @@ impl AppState {
                 return 0;
             }
         };
-        // The window came: whatever was wrong with the last ones is over.
-        self.clear_failed_windows(gen).await;
         let cont = (!top_up.autoplay)
             .then(|| next_window(page.panel, page.items.len(), page.continuation.clone()));
         let Some(mut added) =
@@ -3277,6 +3273,12 @@ impl AppState {
             if !window_may_land(top_up, &q, seed, from_token) {
                 return None;
             }
+            if !top_up.autoplay {
+                // The answer belongs to the radio's current sequence: whatever was wrong with
+                // the last ones is over. A foreign or stale window is dropped above and leaves
+                // the count alone.
+                q.radio_fails = 0;
+            }
             // Against the queue as it is *now*, not a snapshot from before the fetch: a playlist
             // fill, a guest add or `play_song`'s own hydration can all have appended something
             // while we were on the network, and dropping a stale set on top of it duplicates.
@@ -3286,37 +3288,8 @@ impl AppState {
             // What the window said about the next one, kept in the same breath as the append so
             // a window fetched but not appended is never skipped over. Only a radio hands one in,
             // and only for a window that still belongs here.
-            match cont {
-                None => {}
-                // The panel's own token: the window after this one. Unless the cap cut this
-                // window short: the token points past the tracks that did not fit, and those are
-                // only reachable by asking for this window again — so the token stays where it
-                // was, and the next top-up asks for the same window.
-                Some(NextWindow::Token(token)) => {
-                    if !left {
-                        q.radio_cont = Some((seed.to_owned(), Some(token)));
-                    }
-                }
-                // A panel without a continuation: the radio ends here. This is the only thing
-                // that may say so.
-                Some(NextWindow::Ended) => {
-                    q.radio_cont = Some((seed.to_owned(), None));
-                }
-                // The window told us nothing: a foreign or expired token, or an answer that is
-                // not about a radio at all. That is not the radio's end — the radio's own token
-                // is worth one more try from the seed — but there is no window either, so no
-                // token is written.
-                Some(NextWindow::Unknown) => match unknown_window(&q) {
-                    Unknown::Retry => q.radio_cont = None, // ask again from the seed
-                    Unknown::FallBack => {
-                        // The seed was asked and answered nothing too: this radio cannot be
-                        // continued, so the queue goes back to autoplay, which is what it was
-                        // before the radio took it over.
-                        q.radio = false;
-                        q.radio_cont = None;
-                        no_radio = true;
-                    }
-                },
+            if let Some(said) = cont.as_ref() {
+                no_radio = apply_radio_said(&mut q, seed, said, left);
             }
             // With shuffle on, `shuffle_orig` is the same tracks in the order they had before the
             // shuffle: the window goes in there too, or un-shuffle would drop it.
@@ -3748,6 +3721,7 @@ impl AppState {
             q.shuffle_orig = None; // host rebuilt the queue — local shuffle snapshot is stale
             q.radio_seed = None; // guests never autoplay — the host drives
             q.radio_cont = None;
+            q.radio_fails = 0; // the guest never tops up, but a stale count is still not its own
             q.source_name = None; // the host's context isn't known — header falls back
             q.source_id = None;
             // Once per play, like `seek_to`: a new track gets its own retry, the reload that is
@@ -4612,6 +4586,8 @@ fn splice_radio_into(
     q.source_name = title;
     q.source_id = None; // a radio is nobody's playlist to edit
     q.radio = true;
+    // Failures belonged to the radio this one replaces.
+    q.radio_fails = 0;
     // Shuffle is sticky across queues: re-snapshot the new order as the "original", then shuffle
     // what's upcoming (same handling as a radio hydration in `play_song`).
     if q.shuffle_orig.is_some() {
@@ -4822,24 +4798,36 @@ fn next_window(panel: bool, rows: usize, continuation: Option<String>) -> NextWi
     }
 }
 
-/// What a radio does with a window that told it nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unknown {
-    /// The radio's own token is worth one more try: ask again from the seed.
-    Retry,
-    /// The seed was asked and answered nothing too: the radio cannot be continued, so the queue
-    /// goes back to autoplay, which is what it was before the radio took it over.
-    FallBack,
-}
-
-/// What a radio does with a window that told it nothing, given what the queue holds: a radio
-/// that still has a token is worth one more try, from the seed; one that has none was already
-/// asked from the seed, so it cannot be continued at all.
-fn unknown_window(q: &QueueState) -> Unknown {
-    if q.radio_cont.is_some() {
-        Unknown::Retry
-    } else {
-        Unknown::FallBack
+/// Apply what a fetched window said about the next one. The token/end moves only when the cap
+/// did not cut the window short: the tracks that did not fit are reachable only by asking for
+/// this window again. A window that told us nothing is not the end: a radio that still holds a
+/// token gets one retry from the seed; one that has none was already asked from the seed, so it
+/// falls back to autoplay. Returns whether the queue is no longer a radio.
+fn apply_radio_said(q: &mut QueueState, seed: &str, said: &NextWindow, capped: bool) -> bool {
+    match said {
+        NextWindow::Token(token) => {
+            if !capped {
+                q.radio_cont = Some((seed.to_owned(), Some(token.clone())));
+            }
+            false
+        }
+        NextWindow::Ended => {
+            if !capped {
+                q.radio_cont = Some((seed.to_owned(), None));
+            }
+            false
+        }
+        NextWindow::Unknown if q.radio_cont.is_some() => {
+            q.radio_cont = None; // ask again from the seed
+            false
+        }
+        NextWindow::Unknown => {
+            // The seed was asked and answered nothing too: this radio cannot be continued, so
+            // the queue goes back to autoplay, which is what it was before the radio took over.
+            q.radio = false;
+            q.radio_cont = None;
+            true
+        }
     }
 }
 
@@ -5418,17 +5406,17 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_twin, append_page, apply_failed_window, backfill_metadata, cache_horizon,
-        drop_duplicates, enqueue_at, failed_window, format_duration, freshen, get_url,
-        guest_insert_index, history_threshold, is_mix, is_radio, loudness_gain, merge_radio,
-        next_index, next_window, parse_duration_ms, persist_fingerprint, plan_top_up,
+        adopt_twin, append_page, apply_failed_window, apply_radio_said, backfill_metadata,
+        cache_horizon, drop_duplicates, enqueue_at, failed_window, format_duration, freshen,
+        get_url, guest_insert_index, history_threshold, is_mix, is_radio, loudness_gain,
+        merge_radio, next_index, next_window, parse_duration_ms, persist_fingerprint, plan_top_up,
         prefer_version, prev_track_title, put_url, queue_fingerprint, radio_exhausted,
         radio_install, radio_seed_for, radio_state, radio_token, repeat_blocks_top_up,
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, skip_repeat, splice_radio_into,
         splice_radio_state, swap_version, sync_shuffle_snapshot, trim_played, twin_position,
-        unknown_window, unshuffled, untag_radio_rows, upcoming_queued, wait_for_top_up_done,
-        wants_top_up, window_may_land, NextWindow, QueueState, RepeatMode, Unknown, VideoUrls,
-        AUTOPLAY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB, RADIO, RADIO_TAIL,
+        unshuffled, untag_radio_rows, upcoming_queued, wait_for_top_up_done, wants_top_up,
+        window_may_land, NextWindow, QueueState, RepeatMode, VideoUrls, AUTOPLAY, KEEP_PLAYED,
+        LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB, RADIO, RADIO_TAIL,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -6734,14 +6722,18 @@ mod tests {
             QueueState { radio: true, radio_seed: Some("RDAMVMa".into()), ..Default::default() };
         apply_failed_window(&mut fresh, RADIO, "RDAMVMa", None, false);
         assert_eq!(fresh.radio_fails, 1);
+        // A refusal on the current token drops it at once.
+        apply_failed_window(&mut q, RADIO, "RDAMVMa", Some("TOK"), true);
+        assert_eq!(q.radio_fails, 0);
+        assert_eq!(q.radio_cont, None);
         // Autoplay never spends a radio token's tries.
         apply_failed_window(&mut q, AUTOPLAY, "RDAMVMa", Some("TOK"), true);
-        assert_eq!(q.radio_fails, 1);
+        assert_eq!(q.radio_fails, 0);
     }
 
     // A window that told the radio nothing is not the radio's end: the radio's own token is
     // worth one more try from the seed, and only a second failure hands the queue back to
-    // autoplay.
+    // autoplay. A cap-cut window must not move the sequence past the tracks that did not fit.
     #[test]
     fn a_window_that_told_nothing_is_not_the_radios_end() {
         let radio = |cont: Option<(&str, Option<&str>)>| QueueState {
@@ -6751,9 +6743,27 @@ mod tests {
             ..QueueState::default()
         };
         // The radio still holds a token: one more try, from the seed.
-        assert_eq!(unknown_window(&radio(Some(("RDAMVMx", Some("TOK"))))), Unknown::Retry);
+        let mut retry = radio(Some(("RDAMVMx", Some("TOK"))));
+        assert!(!apply_radio_said(&mut retry, "RDAMVMx", &NextWindow::Unknown, false));
+        assert_eq!(retry.radio_cont, None);
+        assert!(retry.radio);
         // Nothing left to follow: the seed was asked and answered nothing too.
-        assert_eq!(unknown_window(&radio(None)), Unknown::FallBack);
+        let mut fallback = radio(None);
+        assert!(apply_radio_said(&mut fallback, "RDAMVMx", &NextWindow::Unknown, false));
+        assert!(!fallback.radio);
+        assert_eq!(fallback.radio_cont, None);
+        // A panel says where the next window is, or that there is none.
+        let mut next = radio(None);
+        assert!(!apply_radio_said(&mut next, "RDAMVMx", &NextWindow::Token("TOK2".into()), false,));
+        assert_eq!(radio_token(&next).as_deref(), Some("TOK2"));
+        assert!(!apply_radio_said(&mut next, "RDAMVMx", &NextWindow::Ended, false));
+        assert!(radio_exhausted(&next));
+        // A cap-cut window leaves the sequence where it was: the tracks that did not fit are
+        // reachable by asking for the same window again.
+        let mut capped = radio(Some(("RDAMVMx", Some("TOK"))));
+        assert!(!apply_radio_said(&mut capped, "RDAMVMx", &NextWindow::Ended, true));
+        assert_eq!(radio_token(&capped).as_deref(), Some("TOK"));
+        assert!(!radio_exhausted(&capped));
     }
 
     #[test]
