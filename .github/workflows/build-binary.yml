@@ -28,8 +28,10 @@ concurrency:
 jobs:
   test-and-build:
     runs-on: ubuntu-24.04 # same glibc 2.39 floor as the release leg
-    # Cold cache pays a full test compile plus a thin-LTO release link.
-    timeout-minutes: 60
+    # Cold cache pays a full test compile plus a thin-LTO release link. Apt's
+    # Ubuntu mirror can be slow; the manual build should not be killed halfway
+    # through the release compile because package downloads ate the budget.
+    timeout-minutes: 120
     env:
       # mold instead of GNU ld: linking is the one part of a warm-cache build
       # that isn't cached. Same flag as linux-release.yml and checks.yml.
