@@ -75,10 +75,10 @@ pub struct AppState {
     /// Bumped on every explicit `play`/jump so superseded async resolves discard their result
     /// (cancellation without JoinHandle bookkeeping). context/06 §6.
     generation: AtomicU64,
-    /// Bumped after every top-up finishes, so a caller that found one on the wire can wait for
-    /// it instead of doing nothing: the Skip button at the tail of a queue whose continuation is
-    /// being fetched right now.
-    top_up_done: tokio::sync::watch::Sender<u64>,
+    /// One top-up at a time. Holding it across the fetch keeps the early trigger, a Skip at the
+    /// tail and a shuffle toggle from asking for the same window twice. Background callers
+    /// `try_lock`; Skip and the track-end fallback wait for it, bounded.
+    top_up: Mutex<()>,
     /// Bumped by the `rate` command. [`Self::refresh_from_next`] samples it before its round trip
     /// and throws the answer away if it moved: a like landing in that ~400 ms window is newer
     /// than what YouTube was asked, and applying the stale reply would flip the heart back.
@@ -338,10 +338,6 @@ struct QueueState {
     /// seed track, so without this hold both paths request the same `RDAMVM…` page at the same
     /// moment and the queue ends up holding it twice (issue #255).
     hydrating: Option<u64>,
-    /// An `extend_queue_radio` is fetching this queue's next window right now (the generation it
-    /// is doing it for). The early trigger, a skip at the tail and a shuffle toggle can all ask
-    /// within one round trip; without this hold they fetch the same window twice.
-    topping_up: Option<u64>,
     /// How many windows in a row failed for this radio's token. A token that is not good any
     /// more (an expired continuation) fails the same way every time, so after a few of them the
     /// token is dropped and the radio asks from the seed again — the way it did before it had a
@@ -526,7 +522,7 @@ impl AppState {
             listen: std::sync::Mutex::default(),
             is_playing: AtomicBool::new(false),
             generation: AtomicU64::new(0),
-            top_up_done: tokio::sync::watch::channel(0).0,
+            top_up: Mutex::new(()),
             rate_epoch: AtomicU64::new(0),
             comments: std::sync::Mutex::new(innertube::CommentsSession::default()),
             pending_seek: std::sync::Mutex::new(None),
@@ -2019,8 +2015,17 @@ impl AppState {
             // MPRIS, Discord).
             let me = self.clone();
             tauri::async_runtime::spawn(async move {
+                // A top-up may already be on the wire for this queue. Wait for it before
+                // deciding the queue is over; bumping the generation first would make its
+                // window stale and waste the fetch.
+                let gen = me.generation.load(Ordering::SeqCst);
+                let added = me.extend_queue_radio_wait(gen).await;
+                if me.generation.load(Ordering::SeqCst) != gen {
+                    return; // the user started something else while we waited
+                }
+                // Continuing (or declaring the queue over) is a new generation, like any load.
                 let gen = me.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                if me.extend_queue_radio(gen).await > 0 {
+                if added > 0 || me.has_next().await {
                     {
                         let mut q = me.queue.lock().await;
                         let next = q.current + 1; // the first appended track
@@ -2762,11 +2767,9 @@ impl AppState {
             None => {
                 let gen = self.generation.load(Ordering::SeqCst);
                 // The tail is topped up asynchronously (on track start / track end), so the
-                // continuation may simply not have landed yet. If that top-up is already on the
-                // wire, wait for it rather than leaving Skip a dead button — and then use what
-                // it brought, not what this call fetched.
-                self.wait_for_top_up(gen).await;
-                if self.extend_queue_radio(gen).await > 0 || self.has_next().await {
+                // continuation may simply not have landed yet. Wait for one already on the wire
+                // rather than leaving Skip a dead button, then use what it brought.
+                if self.extend_queue_radio_wait(gen).await > 0 || self.has_next().await {
                     let next = self.queue.lock().await.current + 1;
                     self.play_index(next).await;
                 } else if self.repeats_one().await {
@@ -3068,33 +3071,6 @@ impl AppState {
         }
     }
 
-    /// Lift the hold `extend_queue_radio` put on other top-ups while it was on the wire, unless a
-    /// newer queue has taken it over in the meantime (its own top-up sets its own generation).
-    async fn end_top_up(&self, gen: u64) {
-        {
-            let mut q = self.queue.lock().await;
-            if q.topping_up == Some(gen) {
-                q.topping_up = None;
-            }
-        }
-        // Whoever found this top-up on the wire is waiting for it: let it go on.
-        self.top_up_done.send_modify(|n| *n += 1);
-    }
-
-    /// Wait for a top-up that is already on the wire (see `topping_up`), so a caller that found
-    /// one in flight is not left with nothing to do. Returns at once when none is in flight.
-    ///
-    /// Bounded: a top-up that never finishes (a task that panicked) must not leave the caller
-    /// waiting forever.
-    async fn wait_for_top_up(&self, gen: u64) {
-        let mut rx = self.top_up_done.subscribe();
-        let seen = *rx.borrow_and_update();
-        if self.queue.lock().await.topping_up != Some(gen) {
-            return;
-        }
-        wait_for_top_up_done(&mut rx, seen, TOP_UP_WAIT).await;
-    }
-
     /// A window failed. The token it was asked with may not be good any more, so count the
     /// failures in a row: a refusal settles it at once, and anything else is given a few tries
     /// before the token is dropped and the radio asks from the seed again. A failure only counts
@@ -3133,6 +3109,10 @@ impl AppState {
     /// radio follows its token for up to three more windows when a page adds nothing; when the
     /// chain ends, playback stops exactly as pre-autoplay.
     ///
+    /// One top-up runs at a time ([`Self::top_up`]); a background caller that finds one on the
+    /// wire skips rather than queueing another request. Skip and the track-end fallback use
+    /// [`Self::extend_queue_radio_wait`] instead.
+    ///
     /// Two behaviours share this ([`TopUp`]). A **radio** ([`is_radio`]) is endless on its own
     /// account: no setting gates it, it asks for its next window with [`RADIO_TAIL`] tracks left,
     /// takes 50 and leaves them untagged. The first window is asked for from its seed and the last
@@ -3141,23 +3121,36 @@ impl AppState {
     /// picked: setting on, last two tracks, 20 a hop, tagged `autoplay`, re-seeded from the last
     /// track every time (`radio_seed` when the queue came from a playlist/album page).
     async fn extend_queue_radio(self: &std::sync::Arc<Self>, gen: u64) -> usize {
-        if self.lt.is_guest().await {
+        let Ok(_guard) = self.top_up.try_lock() else { return 0 };
+        self.run_top_up(gen).await
+    }
+
+    /// Top up the tail, waiting (bounded) for a top-up already on the wire. Skip and the
+    /// track-end fallback have nothing else to do, and the window being fetched may be the next
+    /// track they need.
+    async fn extend_queue_radio_wait(self: &std::sync::Arc<Self>, gen: u64) -> usize {
+        let Ok(_guard) = tokio::time::timeout(TOP_UP_WAIT, self.top_up.lock()).await else {
+            return 0;
+        };
+        self.run_top_up(gen).await
+    }
+
+    /// The fetch under [`Self::top_up`]. The generation is rechecked after the lock: a call made
+    /// for a queue that has since been replaced must not top up the new one.
+    async fn run_top_up(self: &std::sync::Arc<Self>, gen: u64) -> usize {
+        if self.lt.is_guest().await || self.generation.load(Ordering::SeqCst) != gen {
             return 0;
         }
         let autoplay_on = self.autoplay_enabled();
         let (last_video, seed, token, top_up) = {
-            let mut q = self.queue.lock().await;
+            let q = self.queue.lock().await;
             let Some(plan) = plan_top_up(&q, gen, autoplay_on) else { return 0 };
-            q.topping_up = Some(gen);
             plan
         };
-        let added = self.follow_top_up(gen, &last_video, &seed, token, top_up).await;
-        self.end_top_up(gen).await;
-        added
+        self.follow_top_up(gen, &last_video, &seed, token, top_up).await
     }
 
-    /// The network half of [`Self::extend_queue_radio`], which holds `topping_up` for the whole
-    /// call so it can clear the marker once, on every path.
+    /// The network half of [`Self::extend_queue_radio`], called while [`Self::top_up`] is held.
     ///
     /// Snapshot → network → re-lock, same discipline as `prime_lookahead`; the generation check
     /// between them is what makes it safe, and `absorb_radio` dedupes against the queue as it is
@@ -4580,9 +4573,8 @@ fn splice_radio_into(
     }
     q.radio_seed = Some(seed);
     q.radio_cont = None;
-    // The top-up that was on the wire was asked for the radio this one replaces. Holding it
-    // would keep the new radio's tail from being topped up until that request comes back.
-    q.topping_up = None;
+    // A new sequence: stop a playlist walk that was filling the queue this replaced.
+    q.epoch += 1;
     q.source_name = title;
     q.source_id = None; // a radio is nobody's playlist to edit
     q.radio = true;
@@ -4897,10 +4889,6 @@ fn plan_top_up(
     if q.hydrating == Some(gen) {
         return None;
     }
-    // Same keying for the queue's own top-up already on the wire.
-    if q.topping_up == Some(gen) {
-        return None;
-    }
     let radio = is_radio(q);
     if repeat_blocks_top_up(q.repeat, radio) {
         return None; // the queue never exhausts under repeat
@@ -4925,26 +4913,9 @@ fn plan_top_up(
     Some((last.video_id.clone(), seed, token, if radio { RADIO } else { AUTOPLAY }))
 }
 
-/// How long a caller waits for a top-up that is on the wire.
+/// How long a waiting caller (Skip or the track-end fallback) waits for a top-up that is on the
+/// wire before giving up.
 const TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
-
-/// Wait until the top-up counter moves past `seen`, or until `timeout` runs out. The counter is
-/// bumped when a top-up finishes, so a waiter is let go as soon as the one it waits for is done —
-/// and a top-up that never finishes does not hold it forever.
-async fn wait_for_top_up_done(
-    rx: &mut tokio::sync::watch::Receiver<u64>,
-    seen: u64,
-    timeout: std::time::Duration,
-) {
-    let _ = tokio::time::timeout(timeout, async {
-        while *rx.borrow_and_update() == seen {
-            if rx.changed().await.is_err() {
-                break; // the state is gone: nothing left to wait for
-            }
-        }
-    })
-    .await;
-}
 
 /// Append radio-continuation tracks to the queue: dedupe against `existing` (the whole current
 /// queue + everything appended this hop), cap at `cap`, and, for autoplay, mark each as `autoplay`
@@ -5414,9 +5385,9 @@ mod tests {
         radio_install, radio_seed_for, radio_state, radio_token, repeat_blocks_top_up,
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, skip_repeat, splice_radio_into,
         splice_radio_state, swap_version, sync_shuffle_snapshot, trim_played, twin_position,
-        unshuffled, untag_radio_rows, upcoming_queued, wait_for_top_up_done, wants_top_up,
-        window_may_land, NextWindow, QueueState, RepeatMode, VideoUrls, AUTOPLAY, KEEP_PLAYED,
-        LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB, RADIO, RADIO_TAIL,
+        unshuffled, untag_radio_rows, upcoming_queued, wants_top_up, window_may_land, NextWindow,
+        QueueState, RepeatMode, VideoUrls, AUTOPLAY, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX,
+        MAX_BOOST_DB, RADIO, RADIO_TAIL,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -5823,8 +5794,11 @@ mod tests {
             song("mine", None),
             song("old1", None),
         ];
+        q.radio_fails = 2;
         splice_radio_into(&mut q, page, "RDAMVMnow".into(), Some("Now Radio".into()));
 
+        assert_eq!(q.epoch, 1, "a splice starts a new sequence");
+        assert_eq!(q.radio_fails, 0, "the failures belonged to the old radio");
         assert_eq!(ids(&q.items), ["done", "now", "mine", "r1", "old1"]);
         assert_eq!(q.current, 1); // nothing moved under the playing track
         assert_eq!(q.radio_seed.as_deref(), Some("RDAMVMnow"));
@@ -6413,19 +6387,17 @@ mod tests {
     }
 
     #[test]
-    fn a_queue_is_asked_for_its_tail_once() {
-        let q = |hydrating, topping_up| QueueState {
+    fn a_queue_being_hydrated_is_not_asked_for_its_tail() {
+        let q = |hydrating| QueueState {
             items: vec![song("a", None), song("b", None)],
             radio: true,
             radio_seed: Some("RDAMVMa".into()),
             hydrating,
-            topping_up,
             ..QueueState::default()
         };
-        assert!(plan_top_up(&q(Some(7), None), 7, true).is_none(), "play_song is hydrating");
-        assert!(plan_top_up(&q(None, Some(7)), 7, true).is_none(), "a top-up is on the wire");
-        // Both markers are keyed to the generation: a queue that replaced that one asks freely.
-        assert!(plan_top_up(&q(Some(7), Some(7)), 8, true).is_some());
+        assert!(plan_top_up(&q(Some(7)), 7, true).is_none(), "play_song is hydrating");
+        // Keyed to the generation: a queue that replaced that one asks freely.
+        assert!(plan_top_up(&q(Some(7)), 8, true).is_some());
     }
 
     #[test]
@@ -6660,28 +6632,6 @@ mod tests {
         assert_eq!(skip_repeat(&picked), RepeatMode::All);
     }
 
-    // The wait a Skip at the tail does for the top-up that is on the wire: it is let go as soon
-    // as that top-up is done, and it does not wait forever for one that never finishes.
-    #[tokio::test]
-    async fn a_waiter_is_let_go_when_the_top_up_finishes() {
-        let (tx, mut rx) = tokio::sync::watch::channel(0u64);
-        let seen = *rx.borrow_and_update();
-        let waiter = tokio::spawn(async move {
-            wait_for_top_up_done(&mut rx, seen, std::time::Duration::from_secs(5)).await;
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tx.send_modify(|n| *n += 1); // the top-up finished
-        waiter.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_waiter_does_not_wait_forever() {
-        let (_tx, mut rx) = tokio::sync::watch::channel(0u64);
-        let seen = *rx.borrow_and_update();
-        // Nothing ever finishes that top-up: the wait gives up on its own.
-        wait_for_top_up_done(&mut rx, seen, std::time::Duration::from_millis(50)).await;
-    }
-
     // A token that is not good any more fails the same way every time, so the count of failures
     // in a row is what tells a dead token from a hiccup.
     #[test]
@@ -6872,10 +6822,12 @@ mod tests {
         q.keep_context(42.5);
         q.items = vec![song("clicked", None)]; // what `play_song` does next
         q.current = 0;
+        q.radio_fails = 2; // the replacing queue's failures must not follow it back
         assert!(q.shuffle_orig.is_none(), "the new queue starts on its own terms");
 
         let prev = q.prev_context.take().expect("the replaced queue is kept");
         assert_eq!(q.restore_context(prev), ("b".into(), 42.5));
+        assert_eq!(q.radio_fails, 0);
         assert_eq!(
             q.items.iter().map(|i| i.video_id.as_str()).collect::<Vec<_>>(),
             ["a", "b", "c"]
