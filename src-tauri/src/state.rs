@@ -1583,6 +1583,7 @@ impl AppState {
             let me = self.clone();
             tokio::spawn(async move { me.fill_playlist(epoch, gen, token, Fill::Playing).await });
         }
+        true
     }
 
     /// Start a radio (context/08): an endless YouTube-generated queue seeded on a song, artist,
