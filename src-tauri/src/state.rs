@@ -4,7 +4,6 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
 
 use std::sync::Arc;
 
@@ -1485,6 +1484,7 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
+        let continuation_for_fill = continuation.clone();
         let _ = self.play_tracks_as(items, start, source_id, source_name, shuffle, continuation, None).await;
     }
 
@@ -1550,7 +1550,7 @@ impl AppState {
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
             let (flagged, cont) = radio_install(radio);
             q.radio = flagged;
-            q.next_window = cont;
+            q.next_window = cont.unwrap_or(NextWindow::Unknown);
             if keep_shuffled {
                 // Snapshot the real playlist order (for un-shuffle), then play the clicked track
                 // first with everything else shuffled behind it. Carried adds are spliced in
@@ -1579,7 +1579,7 @@ impl AppState {
         if self.start_current(gen).await {
             self.prime_lookahead(gen).await;
         }
-        if let Some(token) = continuation {
+        if let Some(token) = continuation_for_fill {
             let me = self.clone();
             tokio::spawn(async move { me.fill_playlist(epoch, gen, token, Fill::Playing).await });
         }
@@ -3125,7 +3125,7 @@ impl AppState {
                 return 0;
             }
         };
-        let cont = next_window(page.panel, page.items.len(), page.continuation.clone());
+        let cont = Some(next_window(page.panel, page.items.len(), page.continuation.clone()));
         let Some(added) = self
             .absorb_radio(gen, &plan, page.items, cont, plan.token.as_deref())
             .await
@@ -3151,7 +3151,7 @@ impl AppState {
                 else {
                     break;
                 };
-                let said = next_window(page.panel, page.items.len(), page.continuation.clone());
+                let said = Some(next_window(page.panel, page.items.len(), page.continuation.clone()));
                 let Some(n) = self
                     .absorb_radio(gen, &plan, page.items, said, Some(&token))
                     .await
