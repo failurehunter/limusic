@@ -1806,7 +1806,7 @@ mod tests {
         let page = it.radio_continuation(&web(), "RADIO_TOKEN", Some("seed")).await.unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].video_id, "nxt1");
-        assert_eq!(page.panel, Some(true));
+        assert_eq!(page.panel, true);
     }
 
     // --- comments reads: as the account without the healer, never a token across the line ---

@@ -73,6 +73,10 @@ pub struct AppState {
     /// credential is set (session key via the titlebar button, user token via Scrobbling settings).
     pub lastfm: crate::lastfm::LastfmHandle,
     queue: Mutex<QueueState>,
+    /// One top-up at a time. Holding it across the fetch keeps the early trigger, a Skip at the
+    /// tail and a shuffle toggle from asking for the same window twice. Background callers
+    /// `try_lock`; Skip and the track-end fallback wait for it, bounded.
+    top_up: Mutex<()>,
     /// Bumped on every explicit `play`/jump so superseded async resolves discard their result
     /// (cancellation without JoinHandle bookkeeping). context/06 §6.
     generation: AtomicU64,
@@ -370,8 +374,9 @@ struct QueueState {
 /// What a fetched `next` panel said about the radio's next window: its own continuation token,
 /// the radio's end (a panel with rows and no continuation), or nothing at all (no panel — the
 /// page was not about a radio, or a dead single-row answer that must not end the sequence).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum NextWindow {
+    #[default]
     Unknown,
     Token(String),
     Ended,
@@ -3219,7 +3224,7 @@ impl AppState {
                 &mut q.items,
                 fresh,
                 existing,
-                plan.batch(),
+                plan.kind.batch(),
                 plan.kind == TopUpKind::Autoplay,
             );
             // What the window said about the next one, kept in the same breath as the append so a
