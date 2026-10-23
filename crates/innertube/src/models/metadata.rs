@@ -333,14 +333,8 @@ pub fn parse_next(root: &Value) -> NextResult {
     // used to fetch the endless mix. `panel` tells whether the answer carried a radio panel, so
     // its continuation belongs to a queue; a bare `next(videoId)` has no panel and its
     // continuation (if any) belongs to nothing.
-    let panel = panel_continuation(root).is_some();
-    let continuation = if panel {
-        // Panel-scoped: radio token first, then legacy token — so a comments/Related token
-        // floating elsewhere in the answer can't be mistaken for the queue's own.
-        panel_continuation(root).unwrap_or(None)
-    } else {
-        None
-    };
+    let panel = has_panel(root);
+    let continuation = find_first_str(root, "continuation");
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
@@ -356,32 +350,12 @@ pub fn parse_next(root: &Value) -> NextResult {
     }
 }
 
-/// Parse a `next` response's continuation from the panel only. Two passes over the panel's
-/// continuation arrays: radio tokens (`nextRadioContinuationData`) first, then the legacy
-/// token (`nextContinuationData`). Returns `None` when there is no panel at all, `Some(None)`
-/// when there is a panel but no continuation token inside it.
-fn panel_continuation(root: &Value) -> Option<Option<String>> {
-    let panels = find_all(root, "playlistPanelRenderer");
-    let continuation_panels = find_all(root, "playlistPanelContinuation");
-    let panel = panels.into_iter().chain(continuation_panels).next()?;
-    // Two passes over the panel's continuation arrays: radio token first, then legacy token.
-    for arr in find_all(panel, "continuations") {
-        let Some(a) = arr.as_array() else { continue };
-        for entry in a {
-            if let Some(token) = entry.get("nextRadioContinuationData")?.get("continuation")?.as_str() {
-                return Some(Some(token.to_owned()));
-            }
-        }
-    }
-    for arr in find_all(panel, "continuations") {
-        let Some(a) = arr.as_array() else { continue };
-        for entry in a {
-            if let Some(token) = entry.get("nextContinuationData")?.get("continuation")?.as_str() {
-                return Some(Some(token.to_owned()));
-            }
-        }
-    }
-    Some(None)
+/// Whether the `next` answer carried a radio panel (`playlistPanelRenderer` /
+/// `playlistPanelContinuation`). A bare `next(videoId)` has no panel, so its continuation — if
+/// any — belongs to nothing.
+fn has_panel(root: &Value) -> bool {
+    find_all(root, "playlistPanelRenderer").next().is_some()
+        || find_all(root, "playlistPanelContinuation").next().is_some()
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a

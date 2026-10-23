@@ -1800,7 +1800,7 @@ mod tests {
             assert!(req.body.contains("\"isAudioOnly\":true"));
             assert!(!req.body.contains("videoId"));
             assert!(!req.body.contains("playlistId"));
-            (200, r#"{"contents":{"playlistPanelRenderer":{"contents":[{"playlistPanelVideoRenderer":{"videoId":"nxt1"}}],"continuations":[{"nextContinuationData":{"continuation":"NEXT"}]}}}}"#.to_owned())
+            (200, r#"{"contents":{"playlistPanelRenderer":{"contents":[{"playlistPanelVideoRenderer":{"videoId":"nxt1"}}]}}}"#.to_owned())
         });
         let it = it_against(&server, true);
         let page = it.radio_continuation(&web(), "RADIO_TOKEN", Some("seed")).await.unwrap();
