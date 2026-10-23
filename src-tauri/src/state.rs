@@ -1515,7 +1515,7 @@ impl AppState {
         }
         // A mix has no "rest of the playlist" worth walking (see `is_mix`) — drop the token.
         let continuation_for_fill = continuation.clone();
-        let continuation = continuation.filter(|_| !is_mix(source_id.as_deref()));
+        let _continuation = continuation.filter(|_| !is_mix(source_id.as_deref()));
         let sticky = self.sticky_shuffle();
         let position = self.current_position();
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -4664,7 +4664,6 @@ impl TopUpKind {
 /// continuation token (radios only), and the kind of top-up.
 struct TopUpPlan {
     kind: TopUpKind,
-    epoch: u64,
     anchor: String,
     seed: String,
     token: Option<String>,
@@ -4739,7 +4738,6 @@ fn plan_top_up(
     };
     Some(TopUpPlan {
         kind: if radio { TopUpKind::Radio } else { TopUpKind::Autoplay },
-        epoch: q.epoch,
         anchor: last.video_id.clone(),
         seed,
         token,

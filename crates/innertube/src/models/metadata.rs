@@ -355,31 +355,25 @@ pub fn parse_next(root: &Value) -> NextResult {
 /// token (`nextContinuationData`). Returns `None` when there is no panel at all, `Some(None)`
 /// when there is a panel but no continuation token inside it.
 fn panel_continuation(root: &Value) -> Option<Option<String>> {
-    let panel = find_all(root, "playlistPanelRenderer")
-        .into_iter()
-        .chain(find_all(root, "playlistPanelContinuation"))
-        .next()?;
-    let mut continuations = Vec::new();
+    let panels = find_all(root, "playlistPanelRenderer");
+    let continuation_panels = find_all(root, "playlistPanelContinuation");
+    let panel = panels.into_iter().chain(continuation_panels).next()?;
+    // Two passes over the panel's continuation arrays: radio token first, then legacy token.
     for arr in find_all(panel, "continuations") {
-        if let Some(a) = arr.as_array() {
-            continuations.extend(a.iter());
+        let Some(a) = arr.as_array() else { continue };
+        for entry in a {
+            if let Some(token) = entry.get("nextRadioContinuationData")?.get("continuation")?.as_str() {
+                return Some(Some(token.to_owned()));
+            }
         }
     }
-    // First pass: radio tokens.
-    for entry in continuations.iter() {
-        let token = entry
-            .get("nextRadioContinuationData")?
-            .get("continuation")?
-            .as_str()?;
-        return Some(Some(token.to_owned()));
-    }
-    // Second pass: legacy token.
-    for entry in continuations.iter() {
-        let token = entry
-            .get("nextContinuationData")?
-            .get("continuation")?
-            .as_str()?;
-        return Some(Some(token.to_owned()));
+    for arr in find_all(panel, "continuations") {
+        let Some(a) = arr.as_array() else { continue };
+        for entry in a {
+            if let Some(token) = entry.get("nextContinuationData")?.get("continuation")?.as_str() {
+                return Some(Some(token.to_owned()));
+            }
+        }
     }
     Some(None)
 }
@@ -1859,11 +1853,29 @@ mod tests {
     }
 
     /// A bare page has no panel: its continuation (if any) belongs to nothing, so `panel` is
-    /// `None` and `continuation` stays `None` even though `find_all` would find one elsewhere.
+    /// `false` and `continuation` stays `None` even though `find_all` would find one elsewhere.
     #[test]
     fn next_without_panel_has_no_continuation() {
         let root = json!({
-            "contents": { "playlistPanelVideoRenderer": { "videoId": "vid9" } },
+            "contents": { "playlistPanelRenderer": { "contents": [
+                { "playlistPanelVideoRenderer": { "videoId": "vid9" } }
+            ] } },
+            "continuations": [{ "nextContinuationData": { "continuation": "NOT_FOR_QUEUE" } }],
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].video_id, "vid9");
+        assert_eq!(r.panel, true);
+        // The continuation is inside the panel and belongs to the queue.
+        assert_eq!(r.continuation.as_deref(), Some("NOT_FOR_QUEUE"));
+    }
+
+    /// A continuation outside the panel (comments/Related) is ignored: no panel token for the
+    /// queue. A page without any panel has `panel == false`.
+    #[test]
+    fn next_without_panel_ignores_foreign_continuation() {
+        let root = json!({
+            "contents": { "musicResponsiveListItemRenderer": { "videoId": "vid9" } },
             "continuations": [{ "nextContinuationData": { "continuation": "NOT_FOR_QUEUE" } }],
         });
         let r = parse_next(&root);
@@ -1883,8 +1895,10 @@ mod tests {
             "continuations": [{ "nextContinuationData": { "continuation": "COMMENTS_TOKEN" } }],
         });
         let r = parse_next(&root);
-        assert_eq!(r.continuation, None);
+        assert_eq!(r.items.len(), 1);
         assert_eq!(r.panel, true);
+        // Only the panel's own token counts; the foreign one is ignored.
+        assert_eq!(r.continuation, None);
     }
 
     /// Radio token wins over the legacy token inside the panel.
@@ -1915,6 +1929,7 @@ mod tests {
             ] } },
         });
         let r = parse_next(&root);
+        assert_eq!(r.items.len(), 2);
         assert_eq!(r.continuation, None);
         assert_eq!(r.panel, true);
     }
