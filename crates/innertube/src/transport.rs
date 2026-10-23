@@ -84,6 +84,11 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::Http(e) if e.status().is_some_and(|s| s.as_u16() == 404))
     }
+
+    /// A 401/403: YouTube said no to this request.
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Error::Http(h) if h.status().is_some_and(|s| s == 401 || s == 403))
+    }
 }
 
 /// `s` if it looks like an enum value (`STATUS_SUCCEEDED`), safe to log.

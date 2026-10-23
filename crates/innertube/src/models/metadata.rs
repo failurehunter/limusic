@@ -267,6 +267,11 @@ pub struct NextResult {
     /// draws its thumbs-up from. `None` when signed out or when YouTube omits the overlay.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rating: Option<Rating>,
+    /// The answer came with a panel (`playlistPanelRenderer` / `playlistPanelContinuation`), so
+    /// its continuation belongs to a radio. Bare `next(videoId)` answers carry no panel and their
+    /// continuation — if any — belongs to nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub panel: Option<bool>,
 }
 
 /// Logged-in account summary from `account/account_menu`. context/01, context/04A, context/15.
@@ -326,8 +331,11 @@ pub fn parse_next(root: &Value) -> NextResult {
         }
     }
     // The automix/radio continuation (context/08): the panel ends with a continuation token
-    // used to fetch the endless mix. Take the first continuation token we find.
-    let continuation = find_first_str(root, "continuation");
+    // used to fetch the endless mix. Take it panel-scoped — radio token first, then the legacy
+    // token — so a comments/Related token floating elsewhere in the answer can't be mistaken for
+    // the queue's own.
+    let panel = panel_continuation(root);
+    let continuation = panel.as_ref().flatten();
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
@@ -339,7 +347,42 @@ pub fn parse_next(root: &Value) -> NextResult {
         // Scoped to the overlay on purpose: a bare `find_first_str` over the whole response would
         // read whatever a future panel row starts carrying instead of the requested video's own.
         rating: root.get("playerOverlays").and_then(like_status),
+        panel: panel.is_some(),
     }
+}
+
+/// Parse a `next` response's continuation from the panel only. Two passes over the panel's
+/// continuation arrays: radio tokens (`nextRadioContinuationData`) first, then the legacy
+/// token (`nextContinuationData`). Returns `None` when there is no panel at all, `Some(None)`
+/// when there is a panel but no continuation token inside it.
+fn panel_continuation(root: &Value) -> Option<Option<String>> {
+    let panel = find_all(root, "playlistPanelRenderer")
+        .into_iter()
+        .chain(find_all(root, "playlistPanelContinuation"))
+        .next()?;
+    let mut continuations = Vec::new();
+    for arr in find_all(panel, "continuations") {
+        if let Some(a) = arr.as_array() {
+            continuations.extend(a.iter());
+        }
+    }
+    // First pass: radio tokens.
+    for entry in continuations.iter() {
+        let token = entry
+            .get("nextRadioContinuationData")?
+            .get("continuation")?
+            .as_str()?;
+        return Some(Some(token.to_owned()));
+    }
+    // Second pass: legacy token.
+    for entry in continuations.iter() {
+        let token = entry
+            .get("nextContinuationData")?
+            .get("continuation")?
+            .as_str()?;
+        return Some(Some(token.to_owned()));
+    }
+    Some(None)
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a
@@ -1810,9 +1853,84 @@ mod tests {
         assert_eq!(r.items[0].duration.as_deref(), Some("4:05"));
         assert_eq!(r.continuation.as_deref(), Some("CONT_TOKEN"));
         assert_eq!(r.lyrics_browse_id.as_deref(), Some("MPLYt_abc123"));
+        assert_eq!(r.panel, Some(true));
         // No overlay in this response, and the panel row carries no `likeStatus` either: the
         // rating has to read as unknown, not as "not liked".
         assert_eq!(r.rating, None);
+    }
+
+    /// A bare page has no panel: its continuation (if any) belongs to nothing, so `panel` is
+    /// `None` and `continuation` stays `None` even though `find_all` would find one elsewhere.
+    #[test]
+    fn next_without_panel_has_no_continuation() {
+        let root = json!({
+            "contents": { "playlistPanelVideoRenderer": { "videoId": "vid9" } },
+            "continuations": [{ "nextContinuationData": { "continuation": "NOT_FOR_QUEUE" } }],
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.items.len(), 1);
+        assert_eq!(r.items[0].video_id, "vid9");
+        assert_eq!(r.panel, None);
+        assert_eq!(r.continuation, None);
+    }
+
+    /// Panel-scoped parsing ignores a comments/Related continuation outside the panel.
+    #[test]
+    fn panel_ignores_foreign_continuation() {
+        let root = json!({
+            "contents": { "playlistPanelRenderer": { "contents": [
+                { "playlistPanelVideoRenderer": { "videoId": "vid9" } }
+            ] } },
+            "continuations": [{ "nextContinuationData": { "continuation": "COMMENTS_TOKEN" } }],
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.continuation, None);
+        assert_eq!(r.panel, Some(true));
+    }
+
+    /// Radio token wins over the legacy token inside the panel.
+    #[test]
+    fn panel_radio_token_wins() {
+        let root = json!({
+            "contents": { "playlistPanelRenderer": { "contents": [
+                { "playlistPanelVideoRenderer": { "videoId": "vid9" } },
+                { "playlistPanelVideoRenderer": { "videoId": "vid10" } },
+            ], "continuations": [
+                { "nextRadioContinuationData": { "continuation": "RADIO_TOKEN" } },
+                { "nextContinuationData": { "continuation": "LEGACY_TOKEN" } },
+            ] } },
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.items.len(), 2);
+        assert_eq!(r.continuation.as_deref(), Some("RADIO_TOKEN"));
+        assert_eq!(r.panel, Some(true));
+    }
+
+    /// Panel with rows but no continuation: radio ended here.
+    #[test]
+    fn panel_ended_has_no_token() {
+        let root = json!({
+            "contents": { "playlistPanelRenderer": { "contents": [
+                { "playlistPanelVideoRenderer": { "videoId": "vid9" } },
+                { "playlistPanelVideoRenderer": { "videoId": "vid10" } },
+            ] } },
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.continuation, None);
+        assert_eq!(r.panel, Some(true));
+    }
+
+    /// `playlistPanelContinuation` is read as a panel too.
+    #[test]
+    fn panel_continuation_node_is_a_panel() {
+        let root = json!({
+            "contents": { "playlistPanelContinuation": { "continuations": [
+                { "nextContinuationData": { "continuation": "CT_TOKEN" } },
+            ] } },
+        });
+        let r = parse_next(&root);
+        assert_eq!(r.continuation.as_deref(), Some("CT_TOKEN"));
+        assert_eq!(r.panel, Some(true));
     }
 
     /// The one place a `next` response states the requested video's rating (issue #93). It has to

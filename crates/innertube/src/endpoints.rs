@@ -238,16 +238,6 @@ impl InnerTube {
         video_id: Option<&str>,
         playlist_id: Option<&str>,
     ) -> Result<NextResult, Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct NextBody {
-            context: Context,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            video_id: Option<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            playlist_id: Option<String>,
-            is_audio_only: bool,
-        }
         let body = NextBody {
             context: self.context_for(metadata_client),
             video_id: video_id.map(str::to_owned),
@@ -255,14 +245,76 @@ impl InnerTube {
             is_audio_only: true,
         };
         let value = self.post("next", metadata_client, &body, true).await?;
-        let mut next = metadata::parse_next(&value);
-        // The seed itself survives: "start radio from this video" must still open on that video,
-        // and the track already playing is never yanked out from under the user.
-        if self.hide_videos() {
-            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == video_id);
+        Ok(self.finish_next(&value, video_id))
+    }
+
+    /// [`Self::next`] that hands a 401/403 back instead of waking the healer — a read the user did
+    /// not ask for (background seed / radio continuation). The caller decides, normally by asking
+    /// anonymously.
+    pub async fn next_no_heal(
+        &self,
+        metadata_client: &YouTubeClient,
+        video_id: Option<&str>,
+        playlist_id: Option<&str>,
+    ) -> Result<NextResult, Error> {
+        let body = NextBody {
+            context: self.context_for(metadata_client),
+            video_id: video_id.map(str::to_owned),
+            playlist_id: playlist_id.map(str::to_owned),
+            is_audio_only: true,
+        };
+        let value = self.post_no_heal("next", metadata_client, &body, true).await?;
+        Ok(self.finish_next(&value, video_id))
+    }
+
+    /// One next page through the panel's own continuation token: what a radio's second and later
+    /// windows ask for. No `video_id`/`playlist_id` — the token carries the whole sequence — and
+    /// a refusal comes back to the caller instead of waking the healer, since it was not a page
+    /// the user just asked for.
+    pub async fn radio_continuation(
+        &self,
+        metadata_client: &YouTubeClient,
+        continuation: &str,
+        seed_video: Option<&str>,
+    ) -> Result<NextResult, Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ContinuationBody {
+            context: Context,
+            continuation: String,
+            is_audio_only: bool,
         }
-        self.drop_blocked_songs(&mut next.items, video_id);
-        Ok(next)
+        let body = ContinuationBody {
+            context: self.context_for(metadata_client),
+            continuation: continuation.to_owned(),
+            is_audio_only: true,
+        };
+        let value = self.post_no_heal("next", metadata_client, &body, true).await?;
+        Ok(self.finish_next(&value, seed_video))
+    }
+
+    /// Shared body of [`Self::next`] and [`Self::next_no_heal`].
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NextBody {
+        context: Context,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        video_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        playlist_id: Option<String>,
+        is_audio_only: bool,
+    }
+
+    /// Turn a `/next` answer into a `NextResult`: parse it, then keep the seed itself alive so
+    /// "start radio from this video" still opens on that video, and the track already playing is
+    /// never yanked out from under the user.
+    fn finish_next(&self, value: &serde_json::Value, seed_video: Option<&str>) -> NextResult {
+        let mut next = metadata::parse_next(value);
+        if self.hide_videos() {
+            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == seed_video);
+        }
+        self.drop_blocked_songs(&mut next.items, seed_video);
+        next
     }
 
     // --- comments. Reads go through `next`: a comments token sent to `browse` is answered with
@@ -282,7 +334,7 @@ impl InnerTube {
                     page.read_as_account = true;
                     return Ok(page);
                 }
-                Err(e) if is_refusal(&e) => {
+                Err(e) if e.is_refusal() => {
                     // Nothing about the request or the account is logged.
                     tracing::debug!("signed-in comments read refused, redoing it anonymously");
                 }
@@ -1574,11 +1626,6 @@ fn accept_answer(
     }
 }
 
-/// A 401/403: YouTube said no to this request.
-fn is_refusal(e: &Error) -> bool {
-    matches!(e, Error::Http(h) if h.status().is_some_and(|s| s == 401 || s == 403))
-}
-
 // Playlist edit/delete want the raw playlistId; browse gives it `VL`-prefixed. context/01.
 fn strip_vl(id: &str) -> &str {
     id.strip_prefix("VL").unwrap_or(id)
@@ -1744,6 +1791,24 @@ mod tests {
         assert_eq!(metadata::find_first_str(&resp, "playlistId").as_deref(), Some("PLnew123"));
     }
 
+    /// A radio continuation asks only for the token (plus `isAudioOnly`, same as `next`): no
+    /// `video_id`/`playlist_id`, because the token carries the whole sequence.
+    #[tokio::test]
+    async fn radio_continuation_asks_only_for_the_token() {
+        let server = MockServer::start(|req| {
+            assert!(req.body.contains("\"continuation\":\"RADIO_TOKEN\""));
+            assert!(req.body.contains("\"isAudioOnly\":true"));
+            assert!(!req.body.contains("videoId"));
+            assert!(!req.body.contains("playlistId"));
+            (200, r#"{"contents":{"playlistPanelRenderer":{"contents":[{"playlistPanelVideoRenderer":{"videoId":"nxt1"}}],"continuations":[{"nextContinuationData":{"continuation":"NEXT"}]}}}} "#.to_owned())
+        });
+        let it = it_against(&server, true);
+        let page = it.radio_continuation(&web(), "RADIO_TOKEN", Some("seed")).await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].video_id, "nxt1");
+        assert_eq!(page.panel, Some(true));
+    }
+
     // --- comments reads: as the account without the healer, never a token across the line ---
 
     use crate::clients::{Clients, METADATA_CLIENT};
@@ -1802,7 +1867,7 @@ mod tests {
 
     /// A refusal comes back as the HTTP error it was, never as an expired session.
     fn is_plain_refusal(e: &Error) -> bool {
-        is_refusal(e) && !matches!(e, Error::SessionExpired)
+        e.is_refusal() && !matches!(e, Error::SessionExpired)
     }
 
     #[tokio::test]
