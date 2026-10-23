@@ -270,8 +270,7 @@ pub struct NextResult {
     /// The answer came with a panel (`playlistPanelRenderer` / `playlistPanelContinuation`), so
     /// its continuation belongs to a radio. Bare `next(videoId)` answers carry no panel and their
     /// continuation — if any — belongs to nothing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub panel: Option<bool>,
+    pub panel: bool,
 }
 
 /// Logged-in account summary from `account/account_menu`. context/01, context/04A, context/15.
@@ -335,7 +334,7 @@ pub fn parse_next(root: &Value) -> NextResult {
     // token — so a comments/Related token floating elsewhere in the answer can't be mistaken for
     // the queue's own.
     let panel = panel_continuation(root);
-    let continuation = panel.as_ref().flatten();
+    let continuation = panel.clone().flatten();
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
@@ -1853,7 +1852,7 @@ mod tests {
         assert_eq!(r.items[0].duration.as_deref(), Some("4:05"));
         assert_eq!(r.continuation.as_deref(), Some("CONT_TOKEN"));
         assert_eq!(r.lyrics_browse_id.as_deref(), Some("MPLYt_abc123"));
-        assert_eq!(r.panel, Some(true));
+        assert_eq!(r.panel, true);
         // No overlay in this response, and the panel row carries no `likeStatus` either: the
         // rating has to read as unknown, not as "not liked".
         assert_eq!(r.rating, None);
@@ -1870,7 +1869,7 @@ mod tests {
         let r = parse_next(&root);
         assert_eq!(r.items.len(), 1);
         assert_eq!(r.items[0].video_id, "vid9");
-        assert_eq!(r.panel, None);
+        assert_eq!(r.panel, false);
         assert_eq!(r.continuation, None);
     }
 
@@ -1885,7 +1884,7 @@ mod tests {
         });
         let r = parse_next(&root);
         assert_eq!(r.continuation, None);
-        assert_eq!(r.panel, Some(true));
+        assert_eq!(r.panel, true);
     }
 
     /// Radio token wins over the legacy token inside the panel.
@@ -1903,7 +1902,7 @@ mod tests {
         let r = parse_next(&root);
         assert_eq!(r.items.len(), 2);
         assert_eq!(r.continuation.as_deref(), Some("RADIO_TOKEN"));
-        assert_eq!(r.panel, Some(true));
+        assert_eq!(r.panel, true);
     }
 
     /// Panel with rows but no continuation: radio ended here.
@@ -1917,7 +1916,7 @@ mod tests {
         });
         let r = parse_next(&root);
         assert_eq!(r.continuation, None);
-        assert_eq!(r.panel, Some(true));
+        assert_eq!(r.panel, true);
     }
 
     /// `playlistPanelContinuation` is read as a panel too.
@@ -1930,7 +1929,7 @@ mod tests {
         });
         let r = parse_next(&root);
         assert_eq!(r.continuation.as_deref(), Some("CT_TOKEN"));
-        assert_eq!(r.panel, Some(true));
+        assert_eq!(r.panel, true);
     }
 
     /// The one place a `next` response states the requested video's rating (issue #93). It has to

@@ -36,6 +36,18 @@ pub const FILTER_COMMUNITY_PLAYLIST: &str = "EgeKAQQoAEABagoQAxAEEAoQCRAF";
 /// A comment's like/unlike/dislike/undislike and delete: `{context, actions: [<token>]}`.
 pub const COMMENT_ACTION_PATH: &str = "comment/perform_comment_action";
 
+/// Shared request body of [`Self::next`] and [`Self::next_no_heal`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NextBody {
+    context: Context,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    video_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    playlist_id: Option<String>,
+    is_audio_only: bool,
+}
+
 impl InnerTube {
     /// `/player` for one client. context/03, context/06.
     ///
@@ -291,18 +303,6 @@ impl InnerTube {
         };
         let value = self.post_no_heal("next", metadata_client, &body, true).await?;
         Ok(self.finish_next(&value, seed_video))
-    }
-
-    /// Shared body of [`Self::next`] and [`Self::next_no_heal`].
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct NextBody {
-        context: Context,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        video_id: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        playlist_id: Option<String>,
-        is_audio_only: bool,
     }
 
     /// Turn a `/next` answer into a `NextResult`: parse it, then keep the seed itself alive so
