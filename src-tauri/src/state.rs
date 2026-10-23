@@ -1484,7 +1484,6 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
-        let continuation_for_fill = continuation.clone();
         let _ = self.play_tracks_as(items, start, source_id, source_name, shuffle, continuation, None).await;
     }
 
@@ -1515,6 +1514,7 @@ impl AppState {
             return false;
         }
         // A mix has no "rest of the playlist" worth walking (see `is_mix`) — drop the token.
+        let continuation_for_fill = continuation.clone();
         let continuation = continuation.filter(|_| !is_mix(source_id.as_deref()));
         let sticky = self.sticky_shuffle();
         let position = self.current_position();
