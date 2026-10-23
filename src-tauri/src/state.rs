@@ -1484,7 +1484,9 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
-        let _ = self.play_tracks_as(items, start, source_id, source_name, shuffle, continuation, None).await;
+        let _ = self
+            .play_tracks_as(items, start, source_id, source_name, shuffle, continuation, None)
+            .await;
     }
 
     /// [`Self::play_tracks`] that can also install the queue as a radio. `radio` is `None` for a
@@ -3106,16 +3108,10 @@ impl AppState {
     /// The network half of [`Self::run_top_up`]. Snapshot → network → re-lock; `absorb_radio`
     /// dedupes against the queue as it is after the fetch, so whatever grew it meanwhile can't
     /// come back as a duplicate.
-    async fn follow_top_up(
-        self: &std::sync::Arc<Self>,
-        gen: u64,
-        plan: TopUpPlan,
-    ) -> usize {
+    async fn follow_top_up(self: &std::sync::Arc<Self>, gen: u64, plan: TopUpPlan) -> usize {
         let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return 0 };
         let page = match &plan.token {
-            Some(token) => {
-                self.it.radio_continuation(client, token, Some(&plan.anchor)).await
-            }
+            Some(token) => self.it.radio_continuation(client, token, Some(&plan.anchor)).await,
             None => self.it.next_no_heal(client, Some(&plan.anchor), Some(&plan.seed)).await,
         };
         let page = match page {
@@ -3127,9 +3123,8 @@ impl AppState {
             }
         };
         let cont = Some(next_window(page.panel, page.items.len(), page.continuation.clone()));
-        let Some(added) = self
-            .absorb_radio(gen, &plan, page.items, cont, plan.token.as_deref())
-            .await
+        let Some(added) =
+            self.absorb_radio(gen, &plan, page.items, cont, plan.token.as_deref()).await
         else {
             return 0; // the queue moved on: this window is not ours
         };
@@ -3152,10 +3147,9 @@ impl AppState {
                 else {
                     break;
                 };
-                let said = Some(next_window(page.panel, page.items.len(), page.continuation.clone()));
-                let Some(n) = self
-                    .absorb_radio(gen, &plan, page.items, said, Some(&token))
-                    .await
+                let said =
+                    Some(next_window(page.panel, page.items.len(), page.continuation.clone()));
+                let Some(n) = self.absorb_radio(gen, &plan, page.items, said, Some(&token)).await
                 else {
                     break;
                 };
@@ -3169,12 +3163,7 @@ impl AppState {
 
     /// Record a failed window. A refusal settles the token at once; anything else counts toward
     /// `RADIO_FAILS`, after which the token is dropped and the radio asks from the seed again.
-    async fn note_failed_window(
-        &self,
-        gen: u64,
-        plan: &TopUpPlan,
-        refused: bool,
-    ) {
+    async fn note_failed_window(&self, gen: u64, plan: &TopUpPlan, refused: bool) {
         if self.generation.load(Ordering::SeqCst) != gen {
             return;
         }
@@ -4697,11 +4686,7 @@ fn radio_exhausted(q: &QueueState) -> bool {
 
 /// What [`extend_queue_radio`] should ask for, if anything. Pure, so every guard that decides
 /// whether the tail is worth a request is testable without a client or network.
-fn plan_top_up(
-    q: &QueueState,
-    gen: u64,
-    autoplay_on: bool,
-) -> Option<TopUpPlan> {
+fn plan_top_up(q: &QueueState, gen: u64, autoplay_on: bool) -> Option<TopUpPlan> {
     // This queue's own `play_song` is already fetching its radio (#255). Keyed to the generation:
     // a marker left by a queue that has since been replaced must not stop the new queue from
     // topping itself up.
@@ -4763,9 +4748,7 @@ fn window_may_land(plan: &TopUpPlan, q: &QueueState, from_token: Option<&str>) -
 /// refusal or once `RADIO_FAILS` is reached, so the radio asks from the seed again. Failures only
 /// count for the sequence they were asked for; a foreign window is ignored.
 fn apply_failed_window(q: &mut QueueState, plan: &TopUpPlan, refused: bool) {
-    if plan.kind == TopUpKind::Autoplay
-        || !window_may_land(plan, q, plan.token.as_deref())
-    {
+    if plan.kind == TopUpKind::Autoplay || !window_may_land(plan, q, plan.token.as_deref()) {
         return;
     }
     q.token_fails = q.token_fails.saturating_add(1);
@@ -5928,6 +5911,7 @@ mod tests {
             items: vec![song("r1", None), added("x1"), song("r2", None), song("r3", None)],
             current: 0,
             radio: true,
+            radio_seed: Some("RDAMVMr1".to_owned()),
             ..QueueState::default()
         };
         assert_eq!(enqueue_at(&q), 2);
