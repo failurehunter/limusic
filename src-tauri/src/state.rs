@@ -385,7 +385,7 @@ enum NextWindow {
 /// playing track, a song's own radio pinned by `play_song`. A queue without a pinned seed (a
 /// playlist, a single song whose radio is dead) is what autoplay tops up.
 fn is_radio(q: &QueueState) -> bool {
-    q.radio && q.radio_seed.is_some()
+    q.radio
 }
 
 /// What was playing before a click replaced the whole queue, so Previous can go back to it.
@@ -5911,7 +5911,6 @@ mod tests {
             items: vec![song("r1", None), added("x1"), song("r2", None), song("r3", None)],
             current: 0,
             radio: true,
-            radio_seed: Some("RDAMVMr1".to_owned()),
             ..QueueState::default()
         };
         assert_eq!(enqueue_at(&q), 2);
