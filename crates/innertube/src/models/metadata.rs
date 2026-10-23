@@ -354,8 +354,8 @@ pub fn parse_next(root: &Value) -> NextResult {
 /// `playlistPanelContinuation`). A bare `next(videoId)` has no panel, so its continuation — if
 /// any — belongs to nothing.
 fn has_panel(root: &Value) -> bool {
-    find_all(root, "playlistPanelRenderer").next().is_some()
-        || find_all(root, "playlistPanelContinuation").next().is_some()
+    !find_all(root, "playlistPanelRenderer").is_empty()
+        || !find_all(root, "playlistPanelContinuation").is_empty()
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a
