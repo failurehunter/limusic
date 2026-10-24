@@ -36,7 +36,7 @@ pub const FILTER_COMMUNITY_PLAYLIST: &str = "EgeKAQQoAEABagoQAxAEEAoQCRAF";
 /// A comment's like/unlike/dislike/undislike and delete: `{context, actions: [<token>]}`.
 pub const COMMENT_ACTION_PATH: &str = "comment/perform_comment_action";
 
-/// Shared request body of [`InnerTube::next`] and [`InnerTube::next_no_heal`].
+/// Request body for `/next`. Either a seed page (`video_id`/`playlist_id`) or a continuation.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NextBody {
@@ -45,6 +45,8 @@ struct NextBody {
     video_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     playlist_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    continuation: Option<String>,
     is_audio_only: bool,
 }
 
@@ -244,18 +246,47 @@ impl InnerTube {
     ///
     /// `video_id` is optional: an artist/mood radio is a playlist id with no seed track
     /// (`playlistId` alone), which is how YouTube itself opens one.
+    /// The `next` request body, shared by every caller. `continuation` is the only field a radio
+    /// page and a seed page don't have in common; `Option` keeps one struct instead of two.
+    fn next_body(
+        &self,
+        client: &YouTubeClient,
+        video_id: Option<&str>,
+        playlist_id: Option<&str>,
+        continuation: Option<&str>,
+    ) -> NextBody {
+        NextBody {
+            context: self.context_for(client),
+            video_id: video_id.map(str::to_owned),
+            playlist_id: playlist_id.map(str::to_owned),
+            continuation: continuation.map(str::to_owned),
+            is_audio_only: true,
+        }
+    }
+
+    /// `next` without waking the healer, retried once anonymously on a refusal. The one copy of
+    /// the retry both `next_no_heal` and `radio_continuation` used to carry.
+    async fn post_next_no_heal(
+        &self,
+        client: &YouTubeClient,
+        body: NextBody,
+    ) -> Result<serde_json::Value, Error> {
+        match self.post_no_heal("next", client, &body, true).await {
+            Err(e) if e.is_refusal() && client.login_supported && self.is_logged_in() => {
+                let body = NextBody { context: self.context_anonymous(client), ..body };
+                self.post_no_heal("next", client, &body, false).await
+            }
+            other => other,
+        }
+    }
+
     pub async fn next(
         &self,
         metadata_client: &YouTubeClient,
         video_id: Option<&str>,
         playlist_id: Option<&str>,
     ) -> Result<NextResult, Error> {
-        let body = NextBody {
-            context: self.context_for(metadata_client),
-            video_id: video_id.map(str::to_owned),
-            playlist_id: playlist_id.map(str::to_owned),
-            is_audio_only: true,
-        };
+        let body = self.next_body(metadata_client, video_id, playlist_id, None);
         let value = self.post("next", metadata_client, &body, true).await?;
         Ok(self.finish_next(&value, video_id))
     }
@@ -269,54 +300,22 @@ impl InnerTube {
         video_id: Option<&str>,
         playlist_id: Option<&str>,
     ) -> Result<NextResult, Error> {
-        let body = NextBody {
-            context: self.context_for(metadata_client),
-            video_id: video_id.map(str::to_owned),
-            playlist_id: playlist_id.map(str::to_owned),
-            is_audio_only: true,
-        };
-        let value = self.post_no_heal("next", metadata_client, &body, true).await;
-        let value = match value {
-            Err(e) if e.is_refusal() && metadata_client.login_supported && self.is_logged_in() => {
-                let body = NextBody { context: self.context_anonymous(metadata_client), ..body };
-                self.post_no_heal("next", metadata_client, &body, false).await?
-            }
-            other => other?,
-        };
+        let body = self.next_body(metadata_client, video_id, playlist_id, None);
+        let value = self.post_next_no_heal(metadata_client, body).await?;
         Ok(self.finish_next(&value, video_id))
     }
 
     /// One next page through the panel's own continuation token: what a radio's second and later
     /// windows ask for. No `video_id`/`playlist_id` — the token carries the whole sequence — and
-    /// a refusal never wakes the healer: a signed-in request is retried once anonymously, and
-    /// only a refusal of that comes back.
+    /// a refusal never wakes the healer: a signed-in request is retried once anonymously.
     pub async fn radio_continuation(
         &self,
         metadata_client: &YouTubeClient,
         continuation: &str,
         seed_video: Option<&str>,
     ) -> Result<NextResult, Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct ContinuationBody {
-            context: Context,
-            continuation: String,
-            is_audio_only: bool,
-        }
-        let body = ContinuationBody {
-            context: self.context_for(metadata_client),
-            continuation: continuation.to_owned(),
-            is_audio_only: true,
-        };
-        let value = self.post_no_heal("next", metadata_client, &body, true).await;
-        let value = match value {
-            Err(e) if e.is_refusal() && metadata_client.login_supported && self.is_logged_in() => {
-                let body =
-                    ContinuationBody { context: self.context_anonymous(metadata_client), ..body };
-                self.post_no_heal("next", metadata_client, &body, false).await?
-            }
-            other => other?,
-        };
+        let body = self.next_body(metadata_client, None, None, Some(continuation));
+        let value = self.post_next_no_heal(metadata_client, body).await?;
         Ok(self.finish_next(&value, seed_video))
     }
 

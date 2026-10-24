@@ -1538,10 +1538,11 @@ impl AppState {
             q.radio_seed = radio_seed_for(source_id);
             q.source_name = source_name;
             reset_window(&mut q);
-            q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
-                                // `start_radio` installs a radio even when its first page carried no panel: the seed
-                                // is still there to ask from again later (baseline behaviour). A chosen playlist/album
-                                // passes `None`.
+            // A `play_song` radio still in flight is for a queue that's gone.
+            // `start_radio` installs a radio even when its first page carried no panel: the seed
+            // is still there to ask from again later (baseline behaviour). A chosen playlist/album
+            // passes `None`.
+            q.hydrating = None;
             q.radio = radio.is_some();
             q.next_window = radio.unwrap_or(NextWindow::Unknown);
             if keep_shuffled {
@@ -2498,9 +2499,13 @@ impl AppState {
             return;
         }
         let mut q = self.queue.lock().await;
-        // The queue can change under a resolve (a guest add inserts at current+1) — enqueueing
-        // then would gaplessly play the wrong song. Verify the slot still holds the same track.
-        if q.items.get(next_idx).map(|i| i.video_id != next_video).unwrap_or(true) {
+        // The queue can change under a resolve (a guest add inserts at current+1, and a detached
+        // prime can outlive the track-end that started it) — enqueueing then would gaplessly
+        // play the wrong song, or the same one already playing. Verify both the slot and that it
+        // is still the slot that plays next.
+        if next_index(q.items.len(), q.current, q.repeat) != Some(next_idx)
+            || q.items.get(next_idx).map(|i| i.video_id != next_video).unwrap_or(true)
+        {
             tracing::debug!(index = next_idx, "queue changed during lookahead resolve — dropped");
             if q.lookahead_loaded == Some(next_idx) {
                 q.lookahead_loaded = None;
@@ -3292,8 +3297,11 @@ impl AppState {
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
             // Appending at the tail never touches a primed lookahead slot; this covers the
-            // "current was last, nothing was primed" case.
-            self.prime_lookahead(gen).await;
+            // "current was last, nothing was primed" case. Detached: `prime_lookahead` resolves
+            // over the network, and this runs under the `top_up` lock — holding it across a
+            // resolve made Skip wait out someone else's round trip (up to `TOP_UP_WAIT`).
+            let me = self.clone();
+            tauri::async_runtime::spawn(async move { me.prime_lookahead(gen).await });
         } else if stopped {
             // Demoted to autoplay with no new rows: the UI needs the flag now.
             self.emit_queue().await;
@@ -5300,6 +5308,8 @@ mod tests {
         retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
         trim_played, twin_position, unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls,
         KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        apply_failed_window, apply_radio_said, next_window, plan_top_up, repeat_blocks_top_up,
+        window_may_land, NextWindow, TopUpKind, TopUpPlan, RADIO_FAILS,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -6331,4 +6341,189 @@ mod tests {
         q.keep_context(0.0);
         assert!(q.prev_context.is_none());
     }
+
+    #[test]
+    fn a_radios_next_window_comes_off_its_panel() {
+        assert_eq!(next_window(false, 50, Some("t".into())), NextWindow::Unknown);
+        assert_eq!(next_window(true, 50, Some("t".into())), NextWindow::Token("t".into()));
+        assert_eq!(next_window(true, 50, None), NextWindow::Ended);
+        // A dead single-row answer must not end the sequence.
+        assert_eq!(next_window(true, 1, None), NextWindow::Unknown);
+        assert_eq!(next_window(true, 0, None), NextWindow::Unknown);
+    }
+
+    #[test]
+    fn repeat_mode_gates_the_tail() {
+        // A radio is endless on its own account: Repeat One doesn't take its tail away.
+        assert!(!repeat_blocks_top_up(RepeatMode::Off, true));
+        assert!(!repeat_blocks_top_up(RepeatMode::One, true));
+        assert!(repeat_blocks_top_up(RepeatMode::All, true));
+        // Autoplay keeps its old rule: not while the queue repeats at all.
+        assert!(!repeat_blocks_top_up(RepeatMode::Off, false));
+        assert!(repeat_blocks_top_up(RepeatMode::One, false));
+        assert!(repeat_blocks_top_up(RepeatMode::All, false));
+    }
+
+    #[test]
+    fn a_window_that_says_nothing_is_only_a_demotion_from_the_seed() {
+        // Following a token and learning nothing: stay a radio, ask from the seed next time.
+        let mut q = QueueState {
+            radio: true,
+            next_window: NextWindow::Token("t".into()),
+            ..QueueState::default()
+        };
+        assert!(!apply_radio_said(&mut q, &NextWindow::Unknown));
+        assert!(q.radio);
+        assert_eq!(q.next_window, NextWindow::Unknown);
+
+        // Asked from the seed and learning nothing: not a radio.
+        let mut q = QueueState { radio: true, ..QueueState::default() };
+        assert!(apply_radio_said(&mut q, &NextWindow::Unknown));
+        assert!(!q.radio);
+
+        // A token and an end are stored as said.
+        let mut q = QueueState { radio: true, ..QueueState::default() };
+        assert!(!apply_radio_said(&mut q, &NextWindow::Token("t2".into())));
+        assert_eq!(q.next_window, NextWindow::Token("t2".into()));
+        assert!(!apply_radio_said(&mut q, &NextWindow::Ended));
+        assert_eq!(q.next_window, NextWindow::Ended);
+    }
+
+    #[test]
+    fn a_failed_window_drops_the_token_after_repeats_or_a_refusal() {
+        let plan = |token: Option<&str>| TopUpPlan {
+            kind: TopUpKind::Radio,
+            anchor: "a".into(),
+            seed: "RDAMVMa".into(),
+            token: token.map(str::to_owned),
+        };
+        let mut q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Token("t".into()),
+            ..QueueState::default()
+        };
+        // One failure keeps the token.
+        apply_failed_window(&mut q, &plan(Some("t")), false);
+        assert_eq!(q.next_window, NextWindow::Token("t".into()));
+        assert_eq!(q.token_fails, 1);
+        // A refusal drops it at once.
+        apply_failed_window(&mut q, &plan(Some("t")), true);
+        assert_eq!(q.next_window, NextWindow::Unknown);
+        assert_eq!(q.token_fails, 0);
+
+        // Enough failures in a row drop it too.
+        let mut q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Token("t".into()),
+            ..QueueState::default()
+        };
+        for _ in 0..RADIO_FAILS {
+            apply_failed_window(&mut q, &plan(Some("t")), false);
+        }
+        assert_eq!(q.next_window, NextWindow::Unknown);
+
+        // A foreign window is ignored: the token it names is not the one we asked for.
+        let mut q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Token("other".into()),
+            ..QueueState::default()
+        };
+        apply_failed_window(&mut q, &plan(Some("t")), true);
+        assert_eq!(q.next_window, NextWindow::Token("other".into()));
+    }
+
+    #[test]
+    fn a_plan_only_asks_when_the_tail_is_near_and_the_settings_allow_it() {
+        let q = |len: usize, current: usize, radio: bool, repeat: RepeatMode| QueueState {
+            items: (0..len)
+                .map(|i| innertube::SongItem {
+                    video_id: format!("v{i}"),
+                    ..Default::default()
+                })
+                .collect(),
+            current,
+            radio,
+            repeat,
+            radio_seed: radio.then(|| "RDAMVMseed".into()),
+            ..QueueState::default()
+        };
+        // Autoplay off, not a radio: nothing to ask for.
+        assert!(plan_top_up(&q(10, 0, false, RepeatMode::Off), 1, false).is_none());
+        // Autoplay on, tail far: nothing yet.
+        assert!(plan_top_up(&q(10, 0, false, RepeatMode::Off), 1, true).is_none());
+        // Autoplay on, tail near: ask, no token.
+        let plan = plan_top_up(&q(3, 1, false, RepeatMode::Off), 1, true).unwrap();
+        assert_eq!(plan.kind, TopUpKind::Autoplay);
+        assert_eq!(plan.token, None);
+        // A radio asks regardless of the autoplay setting, from its pinned seed.
+        let plan = plan_top_up(&q(3, 1, true, RepeatMode::Off), 1, false).unwrap();
+        assert_eq!(plan.kind, TopUpKind::Radio);
+        assert_eq!(plan.seed, "RDAMVMseed");
+        // Following a token: ask with it.
+        let mut radio = q(3, 1, true, RepeatMode::Off);
+        radio.next_window = NextWindow::Token("tok".into());
+        assert_eq!(plan_top_up(&radio, 1, false).unwrap().token.as_deref(), Some("tok"));
+        // The radio ended: no more asking.
+        let mut radio = q(3, 1, true, RepeatMode::Off);
+        radio.next_window = NextWindow::Ended;
+        assert!(plan_top_up(&radio, 1, false).is_none());
+        // This queue's own `play_song` is still fetching its radio: hold off.
+        let mut radio = q(3, 1, true, RepeatMode::Off);
+        radio.hydrating = Some(1);
+        assert!(plan_top_up(&radio, 1, false).is_none());
+    }
+
+    #[test]
+    fn a_window_may_land_only_on_the_queue_it_was_asked_for() {
+        let plan = |kind, seed: &str, token: Option<&str>| TopUpPlan {
+            kind,
+            anchor: "a".into(),
+            seed: seed.into(),
+            token: token.map(str::to_owned),
+        };
+        // Autoplay: only while the queue is still a queue (not a radio).
+        let q = QueueState { radio: false, ..QueueState::default() };
+        assert!(window_may_land(&plan(TopUpKind::Autoplay, "RDAMVMa", None), &q, None));
+        let q = QueueState { radio: true, ..QueueState::default() };
+        assert!(!window_may_land(&plan(TopUpKind::Autoplay, "RDAMVMa", None), &q, None));
+
+        // Radio: only for the same seed and the same token.
+        let q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Token("tok".into()),
+            ..QueueState::default()
+        };
+        assert!(window_may_land(
+            &plan(TopUpKind::Radio, "RDAMVMa", Some("tok")),
+            &q,
+            Some("tok")
+        ));
+        assert!(!window_may_land(
+            &plan(TopUpKind::Radio, "RDAMVMb", Some("tok")),
+            &q,
+            Some("tok")
+        ));
+        // A window asked from the seed only lands while no token is being followed.
+        assert!(!window_may_land(&plan(TopUpKind::Radio, "RDAMVMa", None), &q, None));
+        let q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Unknown,
+            ..QueueState::default()
+        };
+        assert!(window_may_land(&plan(TopUpKind::Radio, "RDAMVMa", None), &q, None));
+        // The radio ended: a seed window must not land.
+        let q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            next_window: NextWindow::Ended,
+            ..QueueState::default()
+        };
+        assert!(!window_may_land(&plan(TopUpKind::Radio, "RDAMVMa", None), &q, None));
+    }
 }
+
