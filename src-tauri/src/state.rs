@@ -3184,6 +3184,8 @@ impl AppState {
         self.freshen_radio(&mut fresh);
         let (added, trimmed, stopped) = {
             let mut q = self.queue.lock().await;
+            // The guard hands out one borrow; a struct ref splits per field.
+            let q = &mut *q;
             // Recheck the generation under the lock: `plan_top_up` ran lock-free.
             if self.generation.load(Ordering::SeqCst) != gen {
                 return None;
@@ -3209,17 +3211,17 @@ impl AppState {
             );
             // What the window said about the next one, kept in the same breath as the append so a
             // window fetched but not appended is never skipped over. Only a radio hands one in.
-            let stopped = cont.as_ref().map_or(false, |said| apply_radio_said(&mut q, said));
+            let stopped = cont.as_ref().map_or(false, |said| apply_radio_said(&mut *q, said));
             // With shuffle on, `shuffle_orig` is a parallel clone; the new rows go in there too,
             // or un-shuffle would drop them.
-            if added > 0 {
+            if added > 0 && q.shuffle_orig.is_some() {
                 let rows: Vec<SongItem> = q.items[q.items.len() - added..].to_vec();
                 if let Some(orig) = q.shuffle_orig.as_mut() {
                     orig.extend(rows);
                 }
             }
             // Drop played rows beyond the horizon so an endlessly-extending queue does not grow
-            // without bound. `shuffle_upcoming` skips this when shuffle is on.
+            // without bound.
             let trimmed = if added > 0 {
                 let cur = q.current;
                 let dropped = trim_played(&mut q.items, cur, KEEP_PLAYED);
@@ -3231,6 +3233,14 @@ impl AppState {
             } else {
                 0
             };
+            // Un-shuffle rebuilds `items` from this snapshot, so drop what trim just removed:
+            // otherwise the trimmed rows come back and the snapshot grows for the whole session.
+            if trimmed > 0 {
+                if let Some(orig) = q.shuffle_orig.as_mut() {
+                    let left: HashSet<&str> = q.items.iter().map(|i| i.video_id.as_str()).collect();
+                    orig.retain(|i| left.contains(i.video_id.as_str()));
+                }
+            }
             (added, trimmed, stopped)
         };
         if stopped {
