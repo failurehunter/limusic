@@ -1819,7 +1819,7 @@ mod tests {
         });
         let it = it_against(&server, true);
         let page = it.radio_continuation(&web(), "RADIO_TOKEN", Some("seed")).await.unwrap();
-        assert_eq!(page.panel, true);
+        assert!(page.panel);
     }
 
     // --- comments reads: as the account without the healer, never a token across the line ---

@@ -2396,12 +2396,13 @@ impl AppState {
         }
         for _ in 0..3 {
             let next_idx = {
-                let q = self.queue.lock().await;
+                let mut q = self.queue.lock().await;
                 // Repeat-one primes nothing: mpv loops the file itself (next_index → None).
                 let Some(next) = next_index(q.items.len(), q.current, q.repeat) else { return };
                 if q.lookahead_loaded == Some(next) {
                     return; // already primed
                 }
+                q.lookahead_loaded = Some(next);
                 next
             };
             let (next_video, next_title, next_upload, next_secs) = {
@@ -2413,7 +2414,13 @@ impl AppState {
                         item.is_upload,
                         parse_duration_ms(item.duration.as_deref()) / 1000,
                     ),
-                    None => return,
+                    None => {
+                        let mut q = self.queue.lock().await;
+                        if q.lookahead_loaded == Some(next_idx) {
+                            q.lookahead_loaded = None;
+                        }
+                        return;
+                    }
                 }
             };
             match self.resolve(&next_video, next_upload, next_secs).await {
@@ -2427,11 +2434,21 @@ impl AppState {
                         // would delete a good row from the persisted queue, and the retry loop
                         // would do it again to the row that moved up. Leave the queue alone and
                         // let the next prime try again.
+                        {
+                            let mut q = self.queue.lock().await;
+                            if q.lookahead_loaded == Some(next_idx) {
+                                q.lookahead_loaded = None;
+                            }
+                        }
                         tracing::warn!(video_id = %next_video, error = %e, "lookahead resolve failed, leaving the queue alone");
                         return;
                     }
                     tracing::warn!(video_id = %next_video, error = %e, "lookahead resolve failed, dropping from queue");
                     if self.generation.load(Ordering::SeqCst) != gen {
+                        let mut q = self.queue.lock().await;
+                        if q.lookahead_loaded == Some(next_idx) {
+                            q.lookahead_loaded = None;
+                        }
                         return;
                     }
                     // The queue can shift under a resolve — only remove the slot if it still
@@ -2442,9 +2459,19 @@ impl AppState {
                         q.items.get(next_idx).map(|i| i.video_id == next_video).unwrap_or(false)
                     };
                     if !same {
+                        let mut q = self.queue.lock().await;
+                        if q.lookahead_loaded == Some(next_idx) {
+                            q.lookahead_loaded = None;
+                        }
                         return;
                     }
                     // Box::pin: remove_from_queue can itself re-prime (async recursion).
+                    {
+                        let mut q = self.queue.lock().await;
+                        if q.lookahead_loaded == Some(next_idx) {
+                            q.lookahead_loaded = None;
+                        }
+                    }
                     Box::pin(self.remove_from_queue(next_idx)).await;
                     self.emit_skip(&next_title, skip_reason(&e));
                 }
@@ -2461,6 +2488,10 @@ impl AppState {
         data: PlaybackData,
     ) {
         if self.generation.load(Ordering::SeqCst) != gen {
+            let mut q = self.queue.lock().await;
+            if q.lookahead_loaded == Some(next_idx) {
+                q.lookahead_loaded = None;
+            }
             return;
         }
         let mut q = self.queue.lock().await;
@@ -2468,15 +2499,12 @@ impl AppState {
         // then would gaplessly play the wrong song. Verify the slot still holds the same track.
         if q.items.get(next_idx).map(|i| i.video_id != next_video).unwrap_or(true) {
             tracing::debug!(index = next_idx, "queue changed during lookahead resolve — dropped");
+            if q.lookahead_loaded == Some(next_idx) {
+                q.lookahead_loaded = None;
+            }
             return;
         }
-        // Another prime already claimed this slot while we resolved. Two run concurrently at the
-        // autoplay trigger point — `start_current` spawns `extend_queue_radio` (which primes after
-        // extending) and its caller primes right after, both on the same generation, so the
-        // pre-resolve "already primed" check in `prime_lookahead` can't see the other one. Appending
-        // again leaves a *duplicate* entry in mpv's playlist, and since the queue advances one index
-        // per end-file, that offsets mpv from `current` for the rest of the session: the dup replays
-        // while the UI shows the track after it.
+        // Another prime already claimed this slot while we resolved.
         if q.lookahead_loaded == Some(next_idx) {
             tracing::debug!(
                 index = next_idx,
@@ -3119,9 +3147,13 @@ impl AppState {
                 return 0;
             }
         };
-        let cont = Some(window_of(&page));
+        let cont = if plan.kind == TopUpKind::Radio {
+            Some(window_of(&page))
+        } else {
+            None
+        };
         let Some(added) =
-            self.absorb_radio(gen, &plan, page.items, cont, plan.token.as_deref()).await
+            self.absorb_radio(gen, &plan, page.items, cont.clone(), plan.token.as_deref()).await
         else {
             return 0; // the queue moved on: this window is not ours
         };
