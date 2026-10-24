@@ -4688,7 +4688,7 @@ const TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The two ways the queue's tail is topped up. Everything else (the fetch, the dedupe, the trim,
 /// the emit, the persist) is shared.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TopUpKind {
     /// Endless YouTube-generated queue (`start_radio`): no setting gates it, rows untagged.
     Radio,
@@ -4707,6 +4707,7 @@ impl TopUpKind {
 
 /// What [`plan_top_up`] should ask for, if anything: the anchor (last track), the seed, the
 /// continuation token (radios only), and the kind of top-up.
+#[derive(Debug)]
 struct TopUpPlan {
     kind: TopUpKind,
     anchor: String,
