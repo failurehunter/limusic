@@ -1389,11 +1389,12 @@ impl AppState {
                 }
                 // This queue's own hydration is done.
                 q.hydrating = None;
-                // Pin the seed only when the page actually continued past the seed song, so a dead
-                // radio stays plain autoplay and asks from the seed later instead of pretending it
-                // is endless. Hydrated rows are tagged `autoplay`: they sit behind manual adds and
-                // are cleared when the user switches autoplay off.
+                // The page continued past the seed song: this queue is a radio now, not autoplay.
+                // Pin the seed and the window so top-ups follow YouTube's token; a dead radio (only
+                // the seed) stays plain autoplay and asks from the seed later. Rows stay untagged:
+                // radio filler survives the autoplay setting and draws no Autoplay divider.
                 if next.items.len() > 1 {
+                    q.radio = true;
                     q.radio_seed = Some(radio_id.clone());
                     q.next_window = window;
                     q.token_fails = 0;
@@ -1403,9 +1404,8 @@ impl AppState {
                 let mut seen: HashSet<String> =
                     q.items.iter().map(|i| i.video_id.clone()).collect();
                 let had_album = q.items.get(q.current).is_some_and(|i| i.album.is_some());
-                for mut item in next.items {
+                for item in next.items {
                     if seen.insert(item.video_id.clone()) {
-                        item.autoplay = true; // hydrated radio rows are autoplay filler
                         q.items.push(item);
                     } else if let Some(have) =
                         q.items.iter_mut().find(|i| i.video_id == item.video_id)
@@ -3310,7 +3310,7 @@ impl AppState {
     pub async fn restore_queue(self: &std::sync::Arc<Self>) {
         let Some(json) = self.db.get_setting("queue_json") else { return };
         let Ok(saved) = serde_json::from_str::<serde_json::Value>(&json) else { return };
-        let items: Vec<SongItem> = saved
+        let mut items: Vec<SongItem> = saved
             .get("items")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
@@ -3324,7 +3324,7 @@ impl AppState {
             .get("repeat")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
-        let shuffle_orig: Option<Vec<SongItem>> =
+        let mut shuffle_orig: Option<Vec<SongItem>> =
             saved.get("shuffleOrig").and_then(|v| serde_json::from_value(v.clone()).ok()).flatten();
         let radio_seed: Option<String> =
             saved.get("radioSeed").and_then(|v| v.as_str()).map(str::to_owned);
@@ -3356,6 +3356,14 @@ impl AppState {
             if let Some(r) = idx.get("repeat").and_then(|v| serde_json::from_value(v.clone()).ok())
             {
                 repeat = r;
+            }
+        }
+        // After the fingerprint check (it hashes the tag): older builds topped radios up through
+        // autoplay and saved that tag. Leaving it would draw an Autoplay divider and let switching
+        // autoplay off cut the radio.
+        if radio && radio_seed.is_some() {
+            for item in items.iter_mut().chain(shuffle_orig.iter_mut().flatten()) {
+                item.autoplay = false;
             }
         }
         let pos = self.db.get_setting("queue_position").and_then(|s| s.parse::<f64>().ok());
