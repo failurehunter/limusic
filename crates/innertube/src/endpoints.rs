@@ -260,9 +260,9 @@ impl InnerTube {
         Ok(self.finish_next(&value, video_id))
     }
 
-    /// [`Self::next`] that hands a 401/403 back instead of waking the healer — a read the user did
-    /// not ask for (background seed / radio continuation). The caller decides, normally by asking
-    /// anonymously.
+    /// [`Self::next`] that never wakes the healer — a read the user did not ask for (background
+    /// seed / radio continuation). A 401/403 on the account is retried once without it, like the
+    /// comments chain: the request was not the user's, so it must not sign them out.
     pub async fn next_no_heal(
         &self,
         metadata_client: &YouTubeClient,
@@ -275,14 +275,21 @@ impl InnerTube {
             playlist_id: playlist_id.map(str::to_owned),
             is_audio_only: true,
         };
-        let value = self.post_no_heal("next", metadata_client, &body, true).await?;
+        let value = self.post_no_heal("next", metadata_client, &body, true).await;
+        let value = match value {
+            Err(e) if e.is_refusal() && metadata_client.login_supported && self.is_logged_in() => {
+                let body = NextBody { context: self.context_anonymous(metadata_client), ..body };
+                self.post_no_heal("next", metadata_client, &body, false).await?
+            }
+            other => other?,
+        };
         Ok(self.finish_next(&value, video_id))
     }
 
     /// One next page through the panel's own continuation token: what a radio's second and later
     /// windows ask for. No `video_id`/`playlist_id` — the token carries the whole sequence — and
-    /// a refusal comes back to the caller instead of waking the healer, since it was not a page
-    /// the user just asked for.
+    /// a refusal never wakes the healer: a signed-in request is retried once anonymously, and
+    /// only a refusal of that comes back.
     pub async fn radio_continuation(
         &self,
         metadata_client: &YouTubeClient,
@@ -301,7 +308,15 @@ impl InnerTube {
             continuation: continuation.to_owned(),
             is_audio_only: true,
         };
-        let value = self.post_no_heal("next", metadata_client, &body, true).await?;
+        let value = self.post_no_heal("next", metadata_client, &body, true).await;
+        let value = match value {
+            Err(e) if e.is_refusal() && metadata_client.login_supported && self.is_logged_in() => {
+                let body =
+                    ContinuationBody { context: self.context_anonymous(metadata_client), ..body };
+                self.post_no_heal("next", metadata_client, &body, false).await?
+            }
+            other => other?,
+        };
         Ok(self.finish_next(&value, seed_video))
     }
 

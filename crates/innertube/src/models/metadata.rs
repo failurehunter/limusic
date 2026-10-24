@@ -352,10 +352,20 @@ pub fn parse_next(root: &Value) -> NextResult {
 
 /// Whether the `next` answer carried a radio panel (`playlistPanelRenderer` /
 /// `playlistPanelContinuation`). A bare `next(videoId)` has no panel, so its continuation — if
-/// any — belongs to nothing.
+/// any — belongs to nothing. Stops at the first match: a radio page carries one near the root,
+/// and the old two `find_all` calls walked the whole tree even when it was there.
 fn has_panel(root: &Value) -> bool {
-    !find_all(root, "playlistPanelRenderer").is_empty()
-        || !find_all(root, "playlistPanelContinuation").is_empty()
+    fn walk(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => map.iter().any(|(k, v)| {
+                matches!(k.as_str(), "playlistPanelRenderer" | "playlistPanelContinuation")
+                    || walk(v)
+            }),
+            Value::Array(arr) => arr.iter().any(walk),
+            _ => false,
+        }
+    }
+    walk(root)
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a

@@ -3069,21 +3069,22 @@ impl AppState {
     /// tracks, `AUTOPLAY_BATCH` a hop, rows tagged `autoplay`, re-seeded from the last track.
     async fn extend_queue_radio(self: &std::sync::Arc<Self>, gen: u64) -> usize {
         let Ok(_guard) = self.top_up.try_lock() else { return 0 };
-        self.run_top_up(gen).await
+        self.run_top_up(gen, true).await
     }
 
     /// Top up the tail, waiting (bounded) for a top-up already on the wire. Skip and the
     /// track-end fallback have nothing else to do, and the window being fetched may be the next
-    /// track they need.
+    /// track they need. They take one window: following empty pages is the background trigger's
+    /// job, not something a waiting Skip should spend two more round trips on.
     async fn extend_queue_radio_wait(self: &std::sync::Arc<Self>, gen: u64) -> usize {
         let Ok(_guard) = tokio::time::timeout(TOP_UP_WAIT, self.top_up.lock()).await else {
             return 0;
         };
-        self.run_top_up(gen).await
+        self.run_top_up(gen, false).await
     }
 
     /// The fetch under [`Self::extend_queue_radio`], called while [`Self::top_up`] is held.
-    async fn run_top_up(self: &std::sync::Arc<Self>, gen: u64) -> usize {
+    async fn run_top_up(self: &std::sync::Arc<Self>, gen: u64, follow_empty: bool) -> usize {
         if self.lt.is_guest().await || self.generation.load(Ordering::SeqCst) != gen {
             return 0;
         }
@@ -3093,13 +3094,18 @@ impl AppState {
             plan_top_up(&q, gen, autoplay_on)
         };
         let Some(plan) = plan else { return 0 };
-        self.follow_top_up(gen, plan).await
+        self.follow_top_up(gen, plan, follow_empty).await
     }
 
     /// The network half of [`Self::run_top_up`]. Snapshot → network → re-lock; `absorb_radio`
     /// dedupes against the queue as it is after the fetch, so whatever grew it meanwhile can't
     /// come back as a duplicate.
-    async fn follow_top_up(self: &std::sync::Arc<Self>, gen: u64, plan: TopUpPlan) -> usize {
+    async fn follow_top_up(
+        self: &std::sync::Arc<Self>,
+        gen: u64,
+        plan: TopUpPlan,
+        follow_empty: bool,
+    ) -> usize {
         let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return 0 };
         let page = match &plan.token {
             Some(token) => self.it.radio_continuation(client, token, Some(&plan.anchor)).await,
@@ -3119,9 +3125,10 @@ impl AppState {
         else {
             return 0; // the queue moved on: this window is not ours
         };
-        // A radio window that added nothing still advanced the token; follow it a few times
-        // before giving up, so the endless radio keeps going past a single empty page.
-        if plan.kind == TopUpKind::Radio && added == 0 {
+        // A radio window that added nothing still advanced the token; the background trigger
+        // follows it a few times before giving up, so the endless radio keeps going past a single
+        // empty page. A waiting Skip already took the one page it asked for.
+        if follow_empty && plan.kind == TopUpKind::Radio && added == 0 {
             for _ in 0..2 {
                 if self.generation.load(Ordering::SeqCst) != gen {
                     break;
@@ -3243,26 +3250,26 @@ impl AppState {
             }
             (added, trimmed, stopped)
         };
-        if stopped {
-            // The panel said the radio ended: the panel's Autoplay switch belongs back.
-            self.emit_queue().await;
-        }
         if added > 0 {
             if plan.kind == TopUpKind::Radio {
                 tracing::info!(added, trimmed, seed = %plan.seed, "radio extended the queue");
             } else {
                 tracing::info!(added, trimmed, seed = %plan.seed, "autoplay extended the queue");
             }
-            if trimmed == 0 {
+            if trimmed == 0 && !stopped {
                 self.emit_queue_appended(added).await;
             } else {
-                self.emit_queue().await; // the front moved, so indices shifted: send the truth
+                // The front moved, or the radio was demoted to autoplay: send the flags with it.
+                self.emit_queue().await;
             }
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
             // Appending at the tail never touches a primed lookahead slot; this covers the
             // "current was last, nothing was primed" case.
             self.prime_lookahead(gen).await;
+        } else if stopped {
+            // Demoted to autoplay with no new rows: the UI needs the flag now.
+            self.emit_queue().await;
         }
         Some(added)
     }
