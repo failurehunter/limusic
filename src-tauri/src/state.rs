@@ -1539,9 +1539,9 @@ impl AppState {
             q.source_name = source_name;
             reset_window(&mut q);
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
-                                // `start_radio` installs a radio even when its first page carried no panel: the
-                                // seed is still there to ask from again later (baseline behaviour). A chosen
-                                // playlist/album passes `None`.
+                                // `start_radio` installs a radio even when its first page carried no panel: the seed
+                                // is still there to ask from again later (baseline behaviour). A chosen playlist/album
+                                // passes `None`.
             q.radio = radio.is_some();
             q.next_window = radio.unwrap_or(NextWindow::Unknown);
             if keep_shuffled {
@@ -2016,7 +2016,10 @@ impl AppState {
             // MPRIS, Discord).
             let me = self.clone();
             tauri::async_runtime::spawn(async move {
-                let gen = me.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                // No generation bump before the wait: this is the queue that just ended, so the
+                // top-up in flight is still for it. Bumping here would make `absorb_radio` drop
+                // it as superseded, and the waiting call would then fetch the same window again.
+                let gen = me.generation.load(Ordering::SeqCst);
                 if me.extend_queue_radio_wait(gen).await > 0 {
                     {
                         let mut q = me.queue.lock().await;
@@ -3143,15 +3146,12 @@ impl AppState {
             }
         };
         let cont = if plan.kind == TopUpKind::Radio { Some(window_of(&page)) } else { None };
-        let Some(added) =
-            self.absorb_radio(gen, &plan, page.items, cont.clone(), plan.token.as_deref()).await
-        else {
-            return 0; // the queue moved on: this window is not ours
-        };
+        let mut added =
+            self.absorb_radio(gen, &plan, page.items, cont.clone(), plan.token.as_deref()).await;
         // A radio window that added nothing still advanced the token; the background trigger
         // follows it a few times before giving up, so the endless radio keeps going past a single
         // empty page. A waiting Skip already took the one page it asked for.
-        if follow_empty && plan.kind == TopUpKind::Radio && added == 0 {
+        if follow_empty && plan.kind == TopUpKind::Radio && added == Some(0) {
             for _ in 0..2 {
                 if self.generation.load(Ordering::SeqCst) != gen {
                     break;
@@ -3169,16 +3169,14 @@ impl AppState {
                     break;
                 };
                 let said = Some(window_of(&page));
-                let Some(n) = self.absorb_radio(gen, &plan, page.items, said, Some(&token)).await
-                else {
-                    break;
-                };
-                if n > 0 {
-                    return n;
+                added = self.absorb_radio(gen, &plan, page.items, said, Some(&token)).await;
+                if added == Some(0) {
+                    continue;
                 }
+                break;
             }
         }
-        added
+        added.unwrap_or(0)
     }
 
     /// Record a failed window. A refusal settles the token at once; anything else counts toward
@@ -3275,7 +3273,13 @@ impl AppState {
         };
         if added > 0 {
             if plan.kind == TopUpKind::Radio {
-                tracing::info!(added, trimmed, seed = %plan.seed, "radio extended the queue");
+                tracing::info!(
+                    added,
+                    trimmed,
+                    seed = %plan.seed,
+                    by_token = plan.token.is_some(),
+                    "radio extended the queue"
+                );
             } else {
                 tracing::info!(added, trimmed, seed = %plan.seed, "autoplay extended the queue");
             }

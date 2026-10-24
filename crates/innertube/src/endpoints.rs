@@ -36,7 +36,7 @@ pub const FILTER_COMMUNITY_PLAYLIST: &str = "EgeKAQQoAEABagoQAxAEEAoQCRAF";
 /// A comment's like/unlike/dislike/undislike and delete: `{context, actions: [<token>]}`.
 pub const COMMENT_ACTION_PATH: &str = "comment/perform_comment_action";
 
-/// Shared request body of [`Self::next`] and [`Self::next_no_heal`].
+/// Shared request body of [`InnerTube::next`] and [`InnerTube::next_no_heal`].
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NextBody {
