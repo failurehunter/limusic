@@ -2504,14 +2504,9 @@ impl AppState {
             }
             return;
         }
-        // Another prime already claimed this slot while we resolved.
-        if q.lookahead_loaded == Some(next_idx) {
-            tracing::debug!(
-                index = next_idx,
-                "lookahead already primed by a concurrent resolve — dropped"
-            );
-            return;
-        }
+        // Claiming the slot in `prime_lookahead` before resolving is what keeps two primes from
+        // resolving the same index, so the duplicate-enqueue guard that used to live here is
+        // gone: it could not tell our own claim from a concurrent one and dropped the result.
         // Headers are global in mpv; the direct-URL clients need none beyond UA, which the
         // current track already set. Just append the URL.
         let url = mpv_stream_url(&data);
@@ -3147,11 +3142,7 @@ impl AppState {
                 return 0;
             }
         };
-        let cont = if plan.kind == TopUpKind::Radio {
-            Some(window_of(&page))
-        } else {
-            None
-        };
+        let cont = if plan.kind == TopUpKind::Radio { Some(window_of(&page)) } else { None };
         let Some(added) =
             self.absorb_radio(gen, &plan, page.items, cont.clone(), plan.token.as_deref()).await
         else {
