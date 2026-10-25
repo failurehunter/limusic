@@ -4713,6 +4713,10 @@ fn prev_track_title(q: &QueueState) -> Option<&str> {
 
 /// Drop played rows beyond `keep` from the front, returning how many were removed so the caller can
 /// rebase every index that pointed into `items`.
+///
+/// `apply_top_up` inlines the same trim plus the `shuffle_orig` cleanup, so production has no
+/// caller; kept here because `trim_played_keeps_the_history_bounded` exercises the arithmetic.
+#[cfg(test)]
 fn trim_played(items: &mut Vec<innertube::SongItem>, current: usize, keep: usize) -> usize {
     let drop = current.saturating_sub(keep);
     if drop == 0 {
@@ -4757,7 +4761,8 @@ fn merge_radio_tagged(
 }
 
 /// [`merge_radio_tagged`] tagging every row as `autoplay`. Kept for the unit tests, which build on
-/// it.
+/// it; production goes through `merge_radio_tagged` so a radio's rows stay untagged.
+#[cfg(test)]
 fn merge_radio(
     items: &mut Vec<SongItem>,
     fresh: Vec<SongItem>,
@@ -5931,14 +5936,24 @@ mod tests {
         };
         assert_eq!(enqueue_at(&q), 4);
 
-        // A radio: ahead of the generated tracks, behind what was added before.
+        // A radio: ahead of the generated tracks, behind what was added before. `is_radio`
+        // requires both the flag and the seed (a bare flag is a pre-radio autoplay queue).
+        let q = QueueState {
+            items: vec![song("r1", None), added("x1"), song("r2", None), song("r3", None)],
+            current: 0,
+            radio: true,
+            radio_seed: Some("RDAMVMx".into()),
+            ..QueueState::default()
+        };
+        assert_eq!(enqueue_at(&q), 2);
+        // Without the seed the same rows are an ordinary autoplay queue: tail, not up front.
         let q = QueueState {
             items: vec![song("r1", None), added("x1"), song("r2", None), song("r3", None)],
             current: 0,
             radio: true,
             ..QueueState::default()
         };
-        assert_eq!(enqueue_at(&q), 2);
+        assert_eq!(enqueue_at(&q), 4);
 
         // Nothing after the playing track: appended, not out of bounds.
         let q = QueueState { items: vec![song("a", None)], current: 0, ..QueueState::default() };
