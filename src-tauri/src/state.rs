@@ -322,6 +322,16 @@ fn is_radio(q: &QueueState) -> bool {
     q.radio && q.radio_seed.is_some()
 }
 
+/// One top-up request: which anchor to ask from, which seed or token to follow, whether the queue
+/// is a radio, and which state the request starts from. Built outside the top-up mutex, rechecked
+/// under it.
+struct TopUpPlan {
+    anchor: String,
+    seed: String,
+    radio: bool,
+    state: RadioState,
+}
+
 #[derive(Default)]
 struct QueueState {
     items: Vec<SongItem>,
@@ -2952,15 +2962,7 @@ impl AppState {
         let _ = self.app.emit(if unchanged { "queue-index" } else { "queue-changed" }, payload);
     }
 
-    /// The state needed to fetch one top-up window.
-struct TopUpPlan {
-    anchor: String,
-    seed: String,
-    radio: bool,
-    state: RadioState,
-}
-
-/// A pure tail append: ship the added rows, not the whole list.
+    /// A pure tail append: ship the added rows, not the whole list.
     ///
     /// `emit_queue` sends every row whenever the fingerprint changed, and an autoplay top-up
     /// changes it every time. Since the list only grew at the end, the panel can push the new rows
@@ -3243,23 +3245,28 @@ struct TopUpPlan {
             let fetched = if plan.radio {
                 match &state {
                     RadioState::Continue(token) => {
-                        self.it.radio_continuation(client, token, Some(&plan.anchor)).await
+                        self.it
+                            .radio_continuation(client, token.as_str(), Some(plan.anchor.as_str()))
+                            .await
                     }
                     // Ended is rejected by `top_up_plan`; Unknown requests from the seed.
                     RadioState::Unknown | RadioState::Ended => {
-                        self.it.next(client, Some(&plan.anchor), Some(&plan.seed)).await
+                        self.it
+                            .next(client, Some(plan.anchor.as_str()), Some(plan.seed.as_str()))
+                            .await
                     }
                 }
             } else {
-                self.it.next(client, Some(&plan.anchor), Some(&plan.seed)).await
+                self.it
+                    .next(client, Some(plan.anchor.as_str()), Some(plan.seed.as_str()))
+                    .await
             };
             let next = match fetched {
                 Ok(next) => next,
                 Err(e) => {
+                    tracing::warn!(error = %e, radio = plan.radio, "top-up fetch failed");
                     if plan.radio {
-                        self.note_radio_failure(gen, &plan, &e).await;
-                    } else {
-                        tracing::warn!(error = %e, "autoplay radio fetch failed");
+                        self.note_radio_failure(gen, &plan, e.is_refusal()).await;
                     }
                     return added_total;
                 }
@@ -3387,7 +3394,7 @@ struct TopUpPlan {
     /// Note one failed radio window. A refusal is final for this attempt — the session needs
     /// healing before a token will work again — so the state drops to `Unknown` at once. Ordinary
     /// failures accumulate; three in a row do the same. A stale failure is discarded.
-    async fn note_radio_failure(&self, gen: u64, plan: &TopUpPlan, e: &innertube::Error) {
+    async fn note_radio_failure(&self, gen: u64, plan: &TopUpPlan, refusal: bool) {
         if self.generation.load(Ordering::SeqCst) != gen {
             return;
         }
@@ -3398,7 +3405,7 @@ struct TopUpPlan {
         {
             return;
         }
-        if e.is_refusal() {
+        if refusal {
             q.radio_state = RadioState::Unknown;
             q.radio_failures = 0;
             return;
