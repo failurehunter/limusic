@@ -537,7 +537,9 @@ const RADIO_TAIL: usize = 5;
 const TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Radio top-up failures in a row that reset the continuation state to `Unknown`.
 const MAX_RADIO_FAILURES: u32 = 3;
-/// Empty/duplicate radio windows to follow in one top-up before giving up.
+/// Empty/duplicate radio windows to follow in one top-up before giving up. Track-end and Skip
+/// wait on the whole top-up, so a page that lands entirely filtered would otherwise pause the
+/// queue. ponytail: raise if a filtered page turns up in more than ~1/20 of attempts.
 const EXTRA_WINDOWS: usize = 3;
 
 type VideoUrls = std::collections::HashMap<String, (String, i64)>;
@@ -2952,10 +2954,19 @@ impl AppState {
     /// all, so when the track list is unchanged this sends a few hundred bytes instead. The UI
     /// keeps the array it already holds (`player.svelte.ts`, `onQueueIndex`).
     async fn emit_queue(&self) {
+        self.emit_queue_with(false).await;
+    }
+
+    /// [`Self::emit_queue`] with the delta check bypassed. A demotion must reach the UI as a
+    /// full `queue-changed` even when the item list did not change — the delta events carry no
+    /// `radio`. The fingerprint still updates on the way through, so the next ordinary
+    /// `emit_queue` sees a fresh value and sends only what changed.
+    async fn emit_queue_with(&self, force_full: bool) {
         let q = self.queue.lock().await;
         let fingerprint = queue_fingerprint(&q.items);
-        let unchanged =
-            self.last_queue_fingerprint.swap(fingerprint, Ordering::Relaxed) == fingerprint;
+        let unchanged = self.last_queue_fingerprint.swap(fingerprint, Ordering::Relaxed)
+            == fingerprint
+            && !force_full;
         let payload = if unchanged {
             serde_json::json!({
                 "currentIndex": q.current,
@@ -3368,23 +3379,27 @@ impl AppState {
             let still = is_radio(&q);
             (added, trimmed, still)
         };
+        // A demotion must go out as `queue-changed` (the delta events carry no `radio`). Only a
+        // radio queue can demote, and only on a seed-based `Unknown`. `still_radio` alone is not
+        // enough: for an ordinary queue it is always `false`, which used to force a full emit on
+        // every no-op autoplay batch.
+        let radio_dropped = plan.radio && !still_radio;
         if added > 0 {
             tracing::info!(added, trimmed, seed = %plan.seed, "top-up extended the queue");
-            if trimmed == 0 && still_radio {
+            if trimmed == 0 && !radio_dropped {
+                // No rows moved: a delta is enough. Autoplay keeps its small `queue-appended`.
                 self.emit_queue_appended(added).await;
             } else {
-                // Rows shifted, or the queue was demoted: send the whole queue so `radio` rides.
+                // Rows shifted, or the queue demoted: send the whole queue so `radio` rides.
                 self.emit_queue().await;
             }
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
             self.prime_lookahead(gen).await;
-        } else if !still_radio {
-            // Demoted with no rows to show: the item list is unchanged, so `emit_queue` would
-            // otherwise send only `queue-index`, which no longer carries `radio`. Reset the
-            // fingerprint so the full event goes out and the UI loses the radio controls.
-            self.last_queue_fingerprint.store(0, Ordering::Relaxed);
-            self.emit_queue().await;
+        } else if radio_dropped {
+            // Demoted with no rows to show: the item list is unchanged, so a plain `emit_queue`
+            // would send only `queue-index`, which carries no `radio`. Force the full event.
+            self.emit_queue_with(true).await;
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
         }
@@ -3405,12 +3420,10 @@ impl AppState {
         {
             return;
         }
-        if refusal {
-            q.radio_state = RadioState::Unknown;
-            q.radio_failures = 0;
-            return;
-        }
-        q.radio_failures = q.radio_failures.saturating_add(1);
+        // A refusal is `MAX` at once: the token will not work again until the session heals,
+        // so there is nothing to learn from retrying it. An ordinary failure just counts.
+        q.radio_failures =
+            if refusal { MAX_RADIO_FAILURES } else { q.radio_failures.saturating_add(1) };
         if q.radio_failures >= MAX_RADIO_FAILURES {
             q.radio_state = RadioState::Unknown;
             q.radio_failures = 0;
