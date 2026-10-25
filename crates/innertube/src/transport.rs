@@ -84,6 +84,13 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Error::Http(e) if e.status().is_some_and(|s| s.as_u16() == 404))
     }
+
+    /// YouTube refused the request outright: an HTTP 401 or 403. A stale session is a refusal
+    /// too (its own variant is not), so a radio top-up can tell "the session needs healing" from
+    /// "try the next window".
+    pub fn is_refusal(&self) -> bool {
+        matches!(self, Error::Http(e) if e.status().is_some_and(|s| s == 401 || s == 403))
+    }
 }
 
 /// `s` if it looks like an enum value (`STATUS_SUCCEEDED`), safe to log.

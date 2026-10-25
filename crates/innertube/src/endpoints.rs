@@ -256,12 +256,46 @@ impl InnerTube {
         };
         let value = self.post("next", metadata_client, &body, true).await?;
         let mut next = metadata::parse_next(&value);
+        self.filter_next(&mut next, video_id);
+        Ok(next)
+    }
+
+    /// Hide-hidden / blocked filtering shared by every `next` path (see `radio_continuation`).
+    /// `anchor` is the video the page was requested for (kept even if it is a video). `None` for
+    /// a continuation that has no single anchor.
+    fn filter_next(&self, next: &mut NextResult, anchor: Option<&str>) {
         // The seed itself survives: "start radio from this video" must still open on that video,
         // and the track already playing is never yanked out from under the user.
         if self.hide_videos() {
-            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == video_id);
+            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == anchor);
         }
-        self.drop_blocked_songs(&mut next.items, video_id);
+        self.drop_blocked_songs(&mut next.items, anchor);
+    }
+
+    /// One window of an endless radio, by its panel's continuation token (`NextResult.panel` told
+    /// the caller whether there is one). `anchor_video` is the last queue track, kept through the
+    /// hidden/blocked filter as the seed exception.
+    ///
+    /// `post_no_heal`: a background top-up must not wake the session healer or sign the user out.
+    /// A refusal comes back as the HTTP error it was; the caller decides what to do with it.
+    pub async fn radio_continuation(
+        &self,
+        client: &YouTubeClient,
+        token: &str,
+        anchor_video: Option<&str>,
+    ) -> Result<NextResult, Error> {
+        #[derive(Serialize)]
+        struct ContinuationBody {
+            context: Context,
+            continuation: String,
+        }
+        let body = ContinuationBody {
+            context: self.context_for(client),
+            continuation: token.to_owned(),
+        };
+        let value = self.post_no_heal("next", client, &body, true).await?;
+        let mut next = metadata::parse_next(&value);
+        self.filter_next(&mut next, anchor_video);
         Ok(next)
     }
 
@@ -1574,9 +1608,10 @@ fn accept_answer(
     }
 }
 
-/// A 401/403: YouTube said no to this request.
+/// A 401/403: YouTube said no to this request. Delegates to [`Error::is_refusal`] so there is
+/// one predicate.
 fn is_refusal(e: &Error) -> bool {
-    matches!(e, Error::Http(h) if h.status().is_some_and(|s| s == 401 || s == 403))
+    e.is_refusal()
 }
 
 // Playlist edit/delete want the raw playlistId; browse gives it `VL`-prefixed. context/01.

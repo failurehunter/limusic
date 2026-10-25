@@ -251,6 +251,11 @@ pub struct SearchResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct NextResult {
     pub items: Vec<SongItem>,
+    /// Whether a playlist panel was found in the response. `continuation` is that panel's own
+    /// token: a bare `find_first_str(root, "continuation")` would take a comment or Related
+    /// token and page the wrong list. A panel with no token is `panel = true`,
+    /// `continuation = None`; the caller decides whether that means the radio ended.
+    pub panel: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,
     /// The lyrics tab's browseId (`MPLYt…`) — feed it to a lyrics `browse` (models::lyrics).
@@ -325,21 +330,45 @@ pub fn parse_next(root: &Value) -> NextResult {
             items.push(item);
         }
     }
-    // The automix/radio continuation (context/08): the panel ends with a continuation token
-    // used to fetch the endless mix. Take the first continuation token we find.
-    let continuation = find_first_str(root, "continuation");
+    // The panel's own continuation token — never a comment or Related one (see `panel_token`).
+    let (panel, continuation) = panel_token(root);
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
     NextResult {
         items,
+        panel,
         continuation,
         lyrics_browse_id: lyrics_browse_id(root),
         automix_playlist_id,
-        // Scoped to the overlay on purpose: a bare `find_first_str` over the whole response would
-        // read whatever a future panel row starts carrying instead of the requested video's own.
         rating: root.get("playerOverlays").and_then(like_status),
     }
+}
+
+/// The playlist panel's own continuation token, and whether a panel was found.
+///
+/// `find_first_str(root, "continuation")` picks up any token in the tree — the comments panel's,
+/// Related's, the lyrics tab's — and a radio top-up that followed it would page the wrong list.
+/// Scoped to the first `playlistPanelRenderer` / `playlistPanelContinuation`. Inside it,
+/// `nextRadioContinuationData` is the radio's own token; `nextContinuationData` is the fallback
+/// for the plain panel (a playlist continuation). Returns `(panel_found, token)`.
+fn panel_token(root: &Value) -> (bool, Option<String>) {
+    let panel = find_all(root, "playlistPanelRenderer")
+        .into_iter()
+        .next()
+        .or_else(|| find_all(root, "playlistPanelContinuation").into_iter().next());
+    let Some(panel) = panel else { return (false, None) };
+    let radio = find_all(panel, "nextRadioContinuationData")
+        .into_iter()
+        .find_map(|d| d.get("continuation").and_then(Value::as_str))
+        .map(str::to_owned);
+    let plain = || {
+        find_all(panel, "nextContinuationData")
+            .into_iter()
+            .find_map(|d| d.get("continuation").and_then(Value::as_str))
+            .map(str::to_owned)
+    };
+    (true, radio.or_else(plain))
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a
@@ -1470,6 +1499,38 @@ mod tests {
                 Segment { start_ms: 86439, twin_start_ms: 123644, duration_ms: 141061 },
             ]
         );
+    }
+
+    // The panel token, not the first token in the tree: a comments or Related continuation that
+    // leaked in would page the wrong list. And a panel with no token is not the same as no panel —
+    // the caller needs to tell a finished radio from an unknown one.
+    #[test]
+    fn panel_token_is_scoped_to_the_playlist_panel() {
+        let panel = |cont: serde_json::Value| {
+            json!({ "contents": { "playlistPanelRenderer": {
+                "contents": [], "continuations": [cont] } } })
+        };
+        // A radio's own token wins.
+        let radio = panel(json!({ "nextRadioContinuationData": { "continuation": "RADIO_TOK" } }));
+        assert_eq!(panel_token(&radio), (true, Some("RADIO_TOK".into())));
+        // The plain panel continuation is the fallback.
+        let plain = panel(json!({ "nextContinuationData": { "continuation": "PLAIN_TOK" } }));
+        assert_eq!(panel_token(&plain), (true, Some("PLAIN_TOK".into())));
+        // Radio wins over plain when both are there.
+        let both = panel(json!([
+            { "nextContinuationData": { "continuation": "PLAIN_TOK" } },
+            { "nextRadioContinuationData": { "continuation": "RADIO_TOK" } }
+        ]));
+        assert_eq!(panel_token(&both), (true, Some("RADIO_TOK".into())));
+        // Panel with no continuation: `panel = true`, `continuation = None`.
+        let empty = panel(json!({}));
+        assert_eq!(panel_token(&empty), (true, None));
+        // Continuation outside the panel is not the panel's.
+        let outside = json!({
+            "comments": { "continuations": [{ "nextContinuationData": { "continuation": "COMMENT_TOK" } }] },
+            "related": { "continuations": [{ "nextContinuationData": { "continuation": "RELATED_TOK" } }] }
+        });
+        assert_eq!(panel_token(&outside), (false, None));
     }
 
     // A real radio page has no automix marker — nothing to escalate to, and nothing to mistake a

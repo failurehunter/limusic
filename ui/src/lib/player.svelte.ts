@@ -1543,7 +1543,8 @@ export function initApp(mini = false): () => void {
 				repeat: q.repeat,
 				sourceName: q.sourceName,
 				sourceId: q.sourceId,
-				prevTrack: q.prevTrack
+				prevTrack: q.prevTrack,
+				radio: q.radio ?? playback.queue.radio
 			};
 		}),
 		api.onQueueAppended((q) => {
@@ -1558,7 +1559,8 @@ export function initApp(mini = false): () => void {
 			playback.queue = {
 				...playback.queue,
 				items,
-				currentIndex: q.currentIndex
+				currentIndex: q.currentIndex,
+				radio: q.radio ?? playback.queue.radio
 			};
 		}),
 		api.onPosition((p) => {

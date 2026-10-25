@@ -103,6 +103,10 @@ export interface QueueState {
 	 *  Set only while `backToPrevious` would actually do something: at the head of the queue, with
 	 *  a kept one behind it. */
 	prevTrack?: string | null;
+	/** The queue is an endless radio and continues through a panel continuation token (plan:
+	 *  endless radio continuation). Absent on older backends, in which case the UI keeps its
+	 *  ordinary autoplay controls. */
+	radio?: boolean;
 }
 
 export interface Account {
@@ -1072,6 +1076,7 @@ export interface QueueIndex {
 	sourceName?: string | null;
 	sourceId?: string | null;
 	prevTrack?: string | null;
+	radio?: boolean;
 	current: SongItem | null;
 }
 
@@ -1087,6 +1092,7 @@ export interface QueueAppended {
 	items: SongItem[];
 	len: number;
 	currentIndex: number;
+	radio?: boolean;
 }
 
 export const onQueueAppended = (cb: (q: QueueAppended) => void): Promise<UnlistenFn> =>
