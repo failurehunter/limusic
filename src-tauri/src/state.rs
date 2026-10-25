@@ -322,6 +322,16 @@ fn is_radio(q: &QueueState) -> bool {
     q.radio && q.radio_seed.is_some()
 }
 
+/// Map a panel/token pair to a radio state: a panel with a token continues through it; a panel
+/// without one has ended; no panel is unknown (the caller decides whether that means a demotion).
+fn radio_state(panel: bool, token: Option<String>) -> RadioState {
+    match (panel, token) {
+        (true, Some(t)) => RadioState::Continue(t),
+        (true, None) => RadioState::Ended,
+        (false, _) => RadioState::Unknown,
+    }
+}
+
 /// One top-up request: which anchor to ask from, which seed or token to follow, whether the queue
 /// is a radio, and which state the request starts from. Built outside the top-up mutex, rechecked
 /// under it.
@@ -439,6 +449,28 @@ impl QueueState {
         }
     }
 
+    /// Drop played rows beyond `keep` from the front, rebasing `current` / `lookahead_loaded` and
+    /// removing the same ids from `shuffle_orig` so unshuffle cannot bring them back. Returns how
+    /// many rows went.
+    ///
+    /// `current < items.len()` is an invariant (every writer of `current` clamps to it), so the
+    /// trim is bounded by `current` alone; no `min(len)` is needed.
+    fn trim_played(&mut self, keep: usize) -> usize {
+        let drop = self.current.saturating_sub(keep);
+        if drop == 0 {
+            return 0;
+        }
+        let dropped: HashSet<String> =
+            self.items[..drop].iter().map(|i| i.video_id.clone()).collect();
+        self.items.drain(..drop);
+        self.current -= drop;
+        self.lookahead_loaded = self.lookahead_loaded.map(|i| i.saturating_sub(drop));
+        if let Some(orig) = self.shuffle_orig.as_mut() {
+            orig.retain(|i| !dropped.contains(&i.video_id));
+        }
+        drop
+    }
+
     /// Set this queue aside so Previous can come back to it. `position` is mpv's.
     ///
     /// Takes `items` and `shuffle_orig` rather than cloning them, so this may only be called from
@@ -496,14 +528,12 @@ const VIDEO_URL_CAP: usize = 8;
 /// How far into a track Previous stops meaning "go back" and starts meaning "start this one over".
 const PREV_REWIND_SECS: f64 = 3.0;
 
-/// Cap on one radio continuation window.
-const RADIO_BATCH: usize = 50;
 /// Cap on one ordinary autoplay batch (unchanged).
 const AUTOPLAY_BATCH: usize = 20;
 /// Radio top-ups start when fewer than this many tracks remain after the playing one.
 const RADIO_TAIL: usize = 5;
 /// How long Skip / track-ended wait for an in-flight top-up before deciding nothing is coming.
-const TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const TOP_UP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Radio top-up failures in a row that reset the continuation state to `Unknown`.
 const MAX_RADIO_FAILURES: u32 = 3;
 /// Empty/duplicate radio windows to follow in one top-up before giving up.
@@ -1441,11 +1471,7 @@ impl AppState {
                 // is a radio that could not be hydrated, not one proven to have ended; leaving it
                 // unpinned keeps the old autoplay behaviour on a dead seed.
                 if q.items.len() > 1 {
-                    let state = match (next.panel, next.continuation.take()) {
-                        (true, Some(t)) => RadioState::Continue(t),
-                        (true, None) => RadioState::Ended,
-                        (false, _) => RadioState::Unknown,
-                    };
+                    let state = radio_state(next.panel, next.continuation.take());
                     q.radio = true;
                     q.radio_seed = Some(radio_id);
                     q.radio_state = state;
@@ -1560,7 +1586,7 @@ impl AppState {
             q.epoch += 1;
             q.current = start;
             q.lookahead_loaded = None;
-            q.source_id = if radio.is_some() { None } else { source_id.clone() };
+            q.source_id = source_id.clone();
             q.radio_seed = match &radio {
                 Some((seed, _)) => Some(seed.clone()),
                 None => radio_seed_for(source_id),
@@ -1713,19 +1739,14 @@ impl AppState {
         const NO_RADIO: &str = "YouTube has no radio for this.";
         let client = self.clients.get(innertube::METADATA_CLIENT).ok_or("no metadata client")?;
         // Panel + token → the state a top-up follows next. A page with more than one row that
-        // still has no token has ended.
-        let state = |panel: bool, token: Option<String>| match (panel, token) {
-            (true, Some(t)) => RadioState::Continue(t),
-            (true, None) => RadioState::Ended,
-            (false, _) => RadioState::Unknown,
-        };
+        // still has no token has ended. (See `radio_state`.)
         let first =
             self.it.next(client, video_id, Some(playlist_id)).await.map_err(|e| e.to_string())?;
         if first.items.len() > 1 {
             return Ok((
                 first.items,
                 playlist_id.to_owned(),
-                state(first.panel, first.continuation),
+                radio_state(first.panel, first.continuation),
             ));
         }
         let Some(video_id) = video_id else { return Err(NO_RADIO.into()) };
@@ -1737,7 +1758,7 @@ impl AppState {
                 .await
                 .map_err(|e| e.to_string())?;
             if page.items.len() > 1 {
-                return Ok((page.items, mix, state(page.panel, page.continuation)));
+                return Ok((page.items, mix, radio_state(page.panel, page.continuation)));
             }
         }
         if bare.items.len() > 1 {
@@ -2942,7 +2963,6 @@ impl AppState {
                 "sourceName": &q.source_name,
                 "sourceId": &q.source_id,
                 "prevTrack": prev_track_title(&q),
-                "radio": is_radio(&q),
                 // The playing row, so `start_current`'s duration/artists backfill still reaches
                 // the panel without shipping the other 4,999 rows to carry it.
                 "current": q.items.get(q.current),
@@ -2976,7 +2996,6 @@ impl AppState {
             "items": &q.items[start..],
             "len": q.items.len(),
             "currentIndex": q.current,
-            "radio": is_radio(&q),
         });
         // Load-bearing: without it the next `emit_queue` thinks the rows are unchanged and sends a
         // `queue-index` for a list that grew, leaving the panel stale.
@@ -3222,11 +3241,11 @@ impl AppState {
     /// independent of the Autoplay setting; an ordinary queue keeps its existing autoplay
     /// behaviour. `wait` is `true` from Skip and track-ended, which may block up to `TOP_UP_WAIT`
     /// on an in-flight top-up; a background trigger skips instead.
-    async fn extend_queue_radio(self: &std::sync::Arc<Self>, gen: u64, wait: bool) -> usize {
+    async fn extend_queue_radio(self: &std::sync::Arc<Self>, gen: u64, blocking: bool) -> usize {
         if self.lt.is_guest().await || self.top_up_plan(gen).await.is_none() {
             return 0;
         }
-        let _top = match if wait {
+        let _top = match if blocking {
             tokio::time::timeout(TOP_UP_WAIT, self.top_up.lock()).await.ok()
         } else {
             self.top_up.try_lock().ok()
@@ -3307,13 +3326,11 @@ impl AppState {
         if !plan.radio && !self.autoplay_enabled() {
             return None;
         }
-        let window_state = match (next.panel, next.continuation.take()) {
-            (true, Some(t)) => RadioState::Continue(t),
-            (true, None) => RadioState::Ended,
-            (false, _) => RadioState::Unknown,
-        };
+        let window_state = radio_state(next.panel, next.continuation.take());
         self.freshen_radio(&mut next.items);
-        let cap = if plan.radio { RADIO_BATCH } else { AUTOPLAY_BATCH };
+        // A radio page is not cut: YouTube bounds its own panel, and a page the cap trimmed would
+        // lose its tail. Only the ordinary autoplay batch keeps its cap.
+        let cap = if plan.radio { usize::MAX } else { AUTOPLAY_BATCH };
         let tag_autoplay = !plan.radio;
         let (added, trimmed, still_radio) = {
             let mut q = self.queue.lock().await;
@@ -3333,30 +3350,8 @@ impl AppState {
             }
             let existing: HashSet<String> = q.items.iter().map(|i| i.video_id.clone()).collect();
             let added = merge_radio_tagged(&mut q.items, next.items, existing, cap, tag_autoplay);
-            // The cap counts unique-new rows: a page cut off by it keeps its token so the rest
-            // can be fetched again, and stays on the old state.
-            let capped = added == cap;
-            let trimmed = if added > 0 {
-                let cur = q.current;
-                let drop_count = cur.saturating_sub(KEEP_PLAYED).min(q.items.len());
-                if drop_count > 0 {
-                    let dropped: HashSet<String> =
-                        q.items[..drop_count].iter().map(|i| i.video_id.clone()).collect();
-                    q.items.drain(..drop_count);
-                    q.current -= drop_count;
-                    q.lookahead_loaded = q.lookahead_loaded.map(|i| i.saturating_sub(drop_count));
-                    // Unshuffle must not bring the trimmed rows back.
-                    if let Some(orig) = q.shuffle_orig.as_mut() {
-                        orig.retain(|i| !dropped.contains(&i.video_id));
-                    }
-                    drop_count
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-            if plan.radio && !capped {
+            let trimmed = if added > 0 { q.trim_played(KEEP_PLAYED) } else { 0 };
+            if plan.radio {
                 q.radio_state = window_state.clone();
                 if matches!(window_state, RadioState::Unknown)
                     && matches!(request_state, RadioState::Unknown)
@@ -3374,16 +3369,20 @@ impl AppState {
         };
         if added > 0 {
             tracing::info!(added, trimmed, seed = %plan.seed, "top-up extended the queue");
-            if trimmed == 0 {
+            if trimmed == 0 && still_radio {
                 self.emit_queue_appended(added).await;
             } else {
-                self.emit_queue().await; // the front moved: indices shifted, send the truth
+                // Rows shifted, or the queue was demoted: send the whole queue so `radio` rides.
+                self.emit_queue().await;
             }
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
             self.prime_lookahead(gen).await;
         } else if !still_radio {
-            // Demoted with no rows to show: the UI must lose the radio controls.
+            // Demoted with no rows to show: the item list is unchanged, so `emit_queue` would
+            // otherwise send only `queue-index`, which no longer carries `radio`. Reset the
+            // fingerprint so the full event goes out and the UI loses the radio controls.
+            self.last_queue_fingerprint.store(0, Ordering::Relaxed);
             self.emit_queue().await;
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
@@ -4711,21 +4710,6 @@ fn prev_track_title(q: &QueueState) -> Option<&str> {
     Some(prev.items[prev.current].title.as_str())
 }
 
-/// Drop played rows beyond `keep` from the front, returning how many were removed so the caller can
-/// rebase every index that pointed into `items`.
-///
-/// `apply_top_up` inlines the same trim plus the `shuffle_orig` cleanup, so production has no
-/// caller; kept here because `trim_played_keeps_the_history_bounded` exercises the arithmetic.
-#[cfg(test)]
-fn trim_played(items: &mut Vec<innertube::SongItem>, current: usize, keep: usize) -> usize {
-    let drop = current.saturating_sub(keep);
-    if drop == 0 {
-        return 0;
-    }
-    items.drain(..drop);
-    drop
-}
-
 /// [`AppState::freshen_radio`]'s order: songs not in `heard` keep YouTube's order and go first,
 /// then the heard ones, least recently heard first, so a page heard end to end still rotates.
 fn freshen(items: &mut [SongItem], heard: &std::collections::HashMap<String, i64>) {
@@ -5234,11 +5218,11 @@ mod tests {
     use super::{
         adopt_twin, append_page, backfill_metadata, cache_horizon, drop_duplicates, enqueue_at,
         format_duration, freshen, get_url, guest_insert_index, history_threshold, is_mix,
-        is_radio, loudness_gain, merge_radio, next_index, parse_duration_ms, persist_fingerprint,
-        prefer_version, prev_track_title, put_url, queue_fingerprint, radio_seed_for,
-        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
-        trim_played, twin_position, unshuffled, upcoming_queued, QueueState, RadioState,
-        RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        is_radio, loudness_gain, merge_radio, merge_radio_tagged, next_index, parse_duration_ms,
+        persist_fingerprint, prefer_version, prev_track_title, put_url, queue_fingerprint,
+        radio_seed_for, radio_state, retain_upcoming, shuffle_new_queue, shuffle_upcoming,
+        splice_radio_into, swap_version, twin_position, unshuffled, upcoming_queued, QueueState,
+        RadioState, RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -5581,33 +5565,87 @@ mod tests {
     /// every persisted blob with it) forever. Indices are what it can break, so assert on video ids.
     #[test]
     fn trim_played_keeps_the_history_bounded() {
-        let mut items: Vec<_> = (0..300).map(|i| song(&format!("s{i}"), None)).collect();
-
         // Nothing to drop while the played run is still within the cap.
-        let mut short = items[..150].to_vec();
-        assert_eq!(trim_played(&mut short, 150, KEEP_PLAYED), 0);
-        assert_eq!(short.len(), 150);
-        assert_eq!(trim_played(&mut Vec::new(), 0, KEEP_PLAYED), 0);
+        let mut q = QueueState {
+            items: (0..150).map(|i| song(&format!("s{i}"), None)).collect(),
+            current: 149,
+            ..QueueState::default()
+        };
+        assert_eq!(q.trim_played(KEEP_PLAYED), 0);
+        assert_eq!(q.items.len(), 150);
 
         // Past the cap: exactly the excess goes, and the playing row is still the playing row.
-        let current = 250;
-        let playing = items[current].video_id.clone();
-        let dropped = trim_played(&mut items, current, KEEP_PLAYED);
-        assert_eq!(dropped, 50);
-        assert_eq!(items.len(), 250);
-        assert_eq!(items[current - dropped].video_id, playing);
+        // The lookahead rebases, and the unshuffle snapshot loses the trimmed ids — otherwise a
+        // later un-shuffle would bring back rows the trim already took.
+        let mut q = QueueState {
+            items: (0..300).map(|i| song(&format!("s{i}"), None)).collect(),
+            current: 250,
+            lookahead_loaded: Some(251),
+            shuffle_orig: Some((0..300).map(|i| song(&format!("s{i}"), None)).collect()),
+            ..QueueState::default()
+        };
+        let playing = q.items[q.current].video_id.clone();
+        assert_eq!(q.trim_played(KEEP_PLAYED), 50);
+        assert_eq!(q.items.len(), 250);
+        assert_eq!(q.items[q.current].video_id, playing);
+        assert_eq!(q.lookahead_loaded, Some(201));
+        let snapshot = q.shuffle_orig.as_ref().unwrap();
+        let ids: std::collections::HashSet<&str> =
+            snapshot.iter().map(|i| i.video_id.as_str()).collect();
+        for i in 0..50 {
+            assert!(!ids.contains(format!("s{i}").as_str()), "trimmed row s{i} is still in the snapshot");
+        }
+        for i in 50..300 {
+            assert!(ids.contains(format!("s{i}").as_str()), "kept row s{i} fell out of the snapshot");
+        }
 
         // An endless radio: append a batch, advance through it, trim. Bounded, not 600-and-rising.
-        let mut items = vec![song("seed", None)];
-        let mut current = 0;
+        let mut q = QueueState {
+            items: vec![song("seed", None)],
+            ..QueueState::default()
+        };
         for hop in 0..30 {
-            items.extend((0..20).map(|i| song(&format!("h{hop}-{i}"), None)));
-            current += 20;
-            let playing = items[current].video_id.clone();
-            current -= trim_played(&mut items, current, KEEP_PLAYED);
-            assert_eq!(items[current].video_id, playing);
-            assert!(items.len() <= KEEP_PLAYED + 21, "grew to {}", items.len());
+            q.items.extend((0..20).map(|i| song(&format!("h{hop}-{i}"), None)));
+            q.current += 20;
+            let playing = q.items[q.current].video_id.clone();
+            q.current -= q.trim_played(KEEP_PLAYED);
+            assert_eq!(q.items[q.current].video_id, playing);
+            assert!(q.items.len() <= KEEP_PLAYED + 21, "grew to {}", q.items.len());
         }
+    }
+
+    // The continuation mapping, in one place so an "Ended vs Unknown" change can't drift apart
+    // across the three call sites (hydration, explicit start, top-up).
+    #[test]
+    fn radio_state_maps_panel_and_token() {
+        assert_eq!(
+            radio_state(true, Some("TOK".into())),
+            RadioState::Continue("TOK".into())
+        );
+        assert_eq!(radio_state(true, None), RadioState::Ended);
+        assert_eq!(radio_state(false, Some("TOK".into())), RadioState::Unknown);
+        assert_eq!(radio_state(false, None), RadioState::Unknown);
+    }
+
+    // A radio's upcoming rows are the queue, not autoplay filler: tagging them as autoplay would
+    // show the "Autoplay" divider under them and let switching Autoplay off remove them.
+    #[test]
+    fn radio_rows_are_not_tagged_autoplay() {
+        let mut items = vec![song("a", None)];
+        let existing: std::collections::HashSet<String> =
+            items.iter().map(|i| i.video_id.clone()).collect();
+        let fresh = vec![song("r1", None), song("r2", None)];
+        let added = merge_radio_tagged(&mut items, fresh, existing, usize::MAX, false);
+        assert_eq!(added, 2);
+        assert!(!items[1].autoplay && !items[2].autoplay);
+
+        // The ordinary autoplay path still tags, so the divider and the "Autoplay off" removal
+        // keep working for what it does own.
+        let mut items = vec![song("a", None)];
+        let existing: std::collections::HashSet<String> =
+            items.iter().map(|i| i.video_id.clone()).collect();
+        merge_radio_tagged(&mut items, vec![song("r1", None)], existing, usize::MAX, true);
+        assert!(items[1].autoplay);
     }
 
     // Autoplay switched off (or Clear queue): only what is still to come goes, and the pre-shuffle

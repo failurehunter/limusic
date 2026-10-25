@@ -255,6 +255,8 @@ pub struct NextResult {
     /// token: a bare `find_first_str(root, "continuation")` would take a comment or Related
     /// token and page the wrong list. A panel with no token is `panel = true`,
     /// `continuation = None`; the caller decides whether that means the radio ended.
+    /// Not serialized: this flag is a Rust-side decision input, the UI does not read it.
+    #[serde(skip)]
     pub panel: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub continuation: Option<String>,

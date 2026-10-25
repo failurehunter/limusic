@@ -1076,7 +1076,6 @@ export interface QueueIndex {
 	sourceName?: string | null;
 	sourceId?: string | null;
 	prevTrack?: string | null;
-	radio?: boolean;
 	current: SongItem | null;
 }
 
@@ -1092,7 +1091,6 @@ export interface QueueAppended {
 	items: SongItem[];
 	len: number;
 	currentIndex: number;
-	radio?: boolean;
 }
 
 export const onQueueAppended = (cb: (q: QueueAppended) => void): Promise<UnlistenFn> =>
