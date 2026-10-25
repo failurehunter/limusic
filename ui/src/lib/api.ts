@@ -1058,6 +1058,10 @@ export interface QueueIndex {
 	sourceName?: string | null;
 	sourceId?: string | null;
 	prevTrack?: string | null;
+	/** This queue is an explicitly started radio (not plain autoplay). Hides the Autoplay switch. */
+	radio?: boolean | null;
+	/** The radio's panel said it ended: playback stops at the tail instead of continuing. */
+	ended?: boolean | null;
 	current: SongItem | null;
 }
 

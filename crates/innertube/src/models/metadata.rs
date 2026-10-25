@@ -333,8 +333,10 @@ pub fn parse_next(root: &Value) -> NextResult {
     // used to fetch the endless mix. `panel` tells whether the answer carried a radio panel, so
     // its continuation belongs to a queue; a bare `next(videoId)` has no panel and its
     // continuation (if any) belongs to nothing.
-    let panel = has_panel(root);
-    let continuation = find_first_str(root, "continuation");
+    let (panel, continuation) = match panel_and_continuation(root) {
+        Some(tok) => (true, tok),
+        None => (false, None),
+    };
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
@@ -350,12 +352,33 @@ pub fn parse_next(root: &Value) -> NextResult {
     }
 }
 
-/// Whether the `next` answer carried a radio panel (`playlistPanelRenderer` /
-/// `playlistPanelContinuation`). A bare `next(videoId)` has no panel, so its continuation — if
-/// any — belongs to nothing.
-fn has_panel(root: &Value) -> bool {
-    !find_all(root, "playlistPanelRenderer").is_empty()
-        || !find_all(root, "playlistPanelContinuation").is_empty()
+/// The first continuation that belongs to a radio panel, or `None` when the answer has no panel.
+/// `Some(None)` means a panel that states no next window (its radio ended, or this page was a
+/// dead single-row answer). A token anywhere outside the panel belongs to something else — a
+/// comments thread, the Related tab — and is deliberately ignored.
+fn panel_and_continuation(root: &Value) -> Option<Option<String>> {
+    let panel = find_all(root, "playlistPanelRenderer")
+        .into_iter()
+        .chain(find_all(root, "playlistPanelContinuation"))
+        .next()?;
+    let Some(entries) = panel.get("continuations").and_then(Value::as_array) else {
+        return Some(None);
+    };
+    for entry in entries {
+        if let Some(tok) =
+            entry.pointer("/nextRadioContinuationData/continuation").and_then(Value::as_str)
+        {
+            return Some(Some(tok.to_owned()));
+        }
+    }
+    for entry in entries {
+        if let Some(tok) =
+            entry.pointer("/nextContinuationData/continuation").and_then(Value::as_str)
+        {
+            return Some(Some(tok.to_owned()));
+        }
+    }
+    Some(None)
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a

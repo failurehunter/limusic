@@ -384,7 +384,7 @@
 		{#if view.rows.length}
 			{@render rows(view.rows, wins[0])}
 			<!-- Said once, where the list stops, rather than leaving it to look unfinished. -->
-			{#if canEdit && !left.count && !view.autoplay.length && (playback.queue.ended || ((playback.queue.repeat ?? 'off') === 'off' && !playback.queue.radio))}
+			{#if canEdit && !left.count && !view.autoplay.length && (playback.queue.ended || ((playback.queue.repeat ?? 'off') === 'off' && !playback.queue.radio && !prefs.autoplay))}
 				<p class="px-2 pt-3 pb-1 text-xs text-muted-foreground" in:fade={{ duration: 150 }}>
 					{t('player.queue_ends')}
 				</p>

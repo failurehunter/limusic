@@ -405,6 +405,13 @@ struct PrevContext {
 }
 
 impl QueueState {
+    /// `radio` is set only by `start_radio` and `play_song`'s hydration; both pin a seed at the
+    /// same time. A raw flag without a seed (a restored queue from before the feature, a
+    /// half-written queue) is not a radio for top-up, UI, or add-placement purposes.
+    fn is_radio(&self) -> bool {
+        self.radio && self.radio_seed.is_some()
+    }
+
     /// Move the play pointer within the same queue.
     fn seek_to(&mut self, index: usize) {
         self.current = index;
@@ -1570,14 +1577,15 @@ impl AppState {
             q.epoch
         };
         // start_current emits now-playing + queue + persists; prime the gapless lookahead after.
-        if self.start_current(gen).await {
+        let started = self.start_current(gen).await;
+        if started {
             self.prime_lookahead(gen).await;
         }
         if let Some(token) = continuation_for_fill {
             let me = self.clone();
             tokio::spawn(async move { me.fill_playlist(epoch, gen, token, Fill::Playing).await });
         }
-        true
+        started
     }
 
     /// Start a radio (context/08): an endless YouTube-generated queue seeded on a song, artist,
@@ -2021,7 +2029,23 @@ impl AppState {
                 // top-up in flight is still for it. Bumping here would make `absorb_radio` drop
                 // it as superseded, and the waiting call would then fetch the same window again.
                 let gen = me.generation.load(Ordering::SeqCst);
-                if me.extend_queue_radio_wait(gen).await > 0 {
+                let added = me.extend_queue_radio_wait(gen).await;
+                // Something started while we were waiting: a skip, a new play, a context switch.
+                // The pause this fallback does belongs to the queue that just ended, not to what
+                // is playing now.
+                if me.generation.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                // The wait may have joined a top-up someone else kicked off, which can append
+                // before we take the queue lock; `has_next` is the truth either way.
+                let has_next = {
+                    let q = me.queue.lock().await;
+                    next_index(q.items.len(), q.current, q.repeat).is_some()
+                };
+                if added > 0 || has_next {
+                    // Bump the generation so any still-in-flight lookahead resolve from the queue
+                    // we just left discards itself.
+                    let gen = me.generation.fetch_add(1, Ordering::SeqCst) + 1;
                     {
                         let mut q = me.queue.lock().await;
                         let next = q.current + 1; // the first appended track
@@ -2779,8 +2803,13 @@ impl AppState {
         let i = {
             let q = self.queue.lock().await;
             // Manual next escapes a repeat-one loop (the next track then loops too), so treat One
-            // as All here: with any repeat engaged the queue wraps instead of dead-ending.
-            let repeat = if q.repeat == RepeatMode::One { RepeatMode::All } else { q.repeat };
+            // as All here — except on a radio, whose tail is topped up rather than wrapped. Its
+            // wrap to the top is the fallback below, for a radio that has genuinely ended.
+            let repeat = if q.repeat == RepeatMode::One && !q.is_radio() {
+                RepeatMode::All
+            } else {
+                q.repeat
+            };
             next_index(q.items.len(), q.current, repeat)
         };
         match i {
@@ -2794,6 +2823,16 @@ impl AppState {
                 if self.extend_queue_radio_wait(gen).await > 0 {
                     let next = self.queue.lock().await.current + 1;
                     self.play_index(next).await;
+                } else {
+                    // A radio under Repeat One whose tail genuinely cannot continue: restart,
+                    // which is what any other queue under One does at its tail.
+                    let restart = {
+                        let q = self.queue.lock().await;
+                        q.repeat == RepeatMode::One && !q.items.is_empty()
+                    };
+                    if restart {
+                        self.play_index(0).await;
+                    }
                 }
             }
         }
@@ -2874,7 +2913,7 @@ impl AppState {
                 "sourceName": &q.source_name,
                 "sourceId": &q.source_id,
                 "prevTrack": prev_track_title(&q),
-                "radio": q.radio,
+                "radio": q.is_radio(),
                 "ended": is_ended(&q),
                 // The playing row, so `start_current`'s duration/artists backfill still reaches
                 // the panel without shipping the other 4,999 rows to carry it.
@@ -2889,7 +2928,7 @@ impl AppState {
                 "sourceName": &q.source_name,
                 "sourceId": &q.source_id,
                 "prevTrack": prev_track_title(&q),
-                "radio": q.radio,
+                "radio": q.is_radio(),
                 "ended": is_ended(&q),
             })
         };
@@ -2960,7 +2999,7 @@ impl AppState {
             "sourceName": &q.source_name,
             "sourceId": &q.source_id,
             "prevTrack": prev_track_title(&q),
-            "radio": q.radio,
+            "radio": q.is_radio(),
             "ended": is_ended(&q),
         })
     }
@@ -3157,7 +3196,7 @@ impl AppState {
         // follows it a few times before giving up, so the endless radio keeps going past a single
         // empty page. A waiting Skip already took the one page it asked for.
         if follow_empty && plan.kind == TopUpKind::Radio && added == Some(0) {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 if self.generation.load(Ordering::SeqCst) != gen {
                     break;
                 }
@@ -3179,6 +3218,28 @@ impl AppState {
                     continue;
                 }
                 break;
+            }
+        }
+        // A radio window can come back entirely blocked. Re-requesting the same seed from the same
+        // anchor returns the same page, so escalate the way `start_radio` does: a song radio on the
+        // last track, which `fetch_radio` bounces through `automixPreviewVideoRenderer` into a
+        // different mix. Once, only when the user actually blocks anyone, so an install that has
+        // blocked nobody keeps today's exact behavior.
+        if added == Some(0)
+            && plan.kind == TopUpKind::Autoplay
+            && self.generation.load(Ordering::SeqCst) == gen
+            && !crate::blocked::list(&self.db).is_empty()
+        {
+            let song_seed = format!("RDAMVM{}", plan.anchor);
+            if let Ok((fresh, seed, _said)) = self.fetch_radio(Some(&plan.anchor), &song_seed).await
+            {
+                let retry = TopUpPlan {
+                    kind: TopUpKind::Autoplay,
+                    anchor: plan.anchor.clone(),
+                    seed,
+                    token: None,
+                };
+                return self.absorb_radio(gen, &retry, fresh, None, None).await.unwrap_or(0);
             }
         }
         added.unwrap_or(0)
@@ -3235,7 +3296,7 @@ impl AppState {
             // fill, a guest add or `play_song`'s own hydration can all have appended something
             // while we were on the network, and dropping a stale set on top of it duplicates.
             let existing: HashSet<String> = q.items.iter().map(|i| i.video_id.clone()).collect();
-            let added = merge_radio(
+            let (added, left) = merge_radio(
                 &mut q.items,
                 fresh,
                 existing,
@@ -3244,7 +3305,7 @@ impl AppState {
             );
             // What the window said about the next one, kept in the same breath as the append so a
             // window fetched but not appended is never skipped over. Only a radio hands one in.
-            let stopped = cont.as_ref().map_or(false, |said| apply_radio_said(&mut *q, said));
+            let stopped = cont.as_ref().map_or(false, |said| apply_radio_said(&mut *q, said, left));
             // With shuffle on, `shuffle_orig` is a parallel clone; the new rows go in there too,
             // or un-shuffle would drop them.
             if added > 0 && q.shuffle_orig.is_some() {
@@ -3344,7 +3405,7 @@ impl AppState {
                     "radioSeed": &q.radio_seed,
                     "sourceName": &q.source_name,
                     "sourceId": &q.source_id,
-                    "radio": q.radio,
+                    "radio": q.is_radio(),
                 })
                 .to_string()
             });
@@ -4439,7 +4500,7 @@ fn track_to_song(t: &Track) -> SongItem {
 /// adds right after the playing track instead.
 fn enqueue_at(q: &QueueState) -> usize {
     let start = (q.current + 1).min(q.items.len());
-    if q.radio {
+    if q.is_radio() {
         let mut at = start;
         while q.items.get(at).is_some_and(|i| i.queued || i.queued_end) {
             at += 1;
@@ -4593,7 +4654,7 @@ fn reset_window(q: &mut QueueState) {
 /// The radio's panel said it ended: playback stops at the tail instead of continuing. Only a
 /// radio shows this; an autoplay queue ending is its normal state.
 fn is_ended(q: &QueueState) -> bool {
-    matches!(q.next_window, NextWindow::Ended) && q.radio
+    matches!(q.next_window, NextWindow::Ended) && q.is_radio()
 }
 
 /// What a fetched `next` panel said about the radio's next window: its own continuation token,
@@ -4657,20 +4718,22 @@ fn merge_radio(
     mut existing: HashSet<String>,
     cap: usize,
     tag_autoplay: bool,
-) -> usize {
+) -> (usize, bool) {
     let mut added = 0;
+    let mut left = false;
     for mut item in fresh {
-        if added >= cap {
-            break;
-        }
         if !existing.insert(item.video_id.clone()) {
             continue; // already in the queue (or appended this hop)
+        }
+        if added >= cap {
+            left = true;
+            continue;
         }
         item.autoplay = tag_autoplay;
         items.push(item);
         added += 1;
     }
-    added
+    (added, left)
 }
 
 /// How many tracks one window takes.
@@ -4750,7 +4813,7 @@ fn plan_top_up(q: &QueueState, gen: u64, autoplay_on: bool) -> Option<TopUpPlan>
     if q.hydrating == Some(gen) {
         return None;
     }
-    let radio = q.radio;
+    let radio = q.is_radio();
     if repeat_blocks_top_up(q.repeat, radio) {
         return None;
     }
@@ -4790,9 +4853,9 @@ fn plan_top_up(q: &QueueState, gen: u64, autoplay_on: bool) -> Option<TopUpPlan>
 /// the playing track swaps the seed without moving the generation, so the window must be dropped.
 fn window_may_land(plan: &TopUpPlan, q: &QueueState, from_token: Option<&str>) -> bool {
     if plan.kind == TopUpKind::Autoplay {
-        return !q.radio;
+        return !q.is_radio();
     }
-    if !q.radio || q.radio_seed.as_deref() != Some(&plan.seed) {
+    if !q.is_radio() || q.radio_seed.as_deref() != Some(&plan.seed) {
         return false;
     }
     match from_token {
@@ -4817,7 +4880,13 @@ fn apply_failed_window(q: &mut QueueState, plan: &TopUpPlan, refused: bool) {
 
 /// What a fetched window said about the radio's next window. Returns whether the queue is no
 /// longer a radio (the panel said it ended, or it answered nothing when asked from the seed).
-fn apply_radio_said(q: &mut QueueState, said: &NextWindow) -> bool {
+fn apply_radio_said(q: &mut QueueState, said: &NextWindow, capped: bool) -> bool {
+    // A window the cap cut short did not tell us what comes after it: the tracks that did not
+    // fit are reachable only by asking for the same window again, so the token, the end state
+    // and the radio flag all stay exactly where they were.
+    if capped {
+        return false;
+    }
     match said {
         NextWindow::Token(token) => {
             q.next_window = NextWindow::Token(token.clone());
@@ -5966,10 +6035,12 @@ mod tests {
         assert_eq!(enqueue_at(&q), 4);
 
         // A radio: ahead of the generated tracks, behind what was added before.
+        // `is_radio()` is `radio && seed`, so the fixture has to pin one.
         let q = QueueState {
             items: vec![song("r1", None), added("x1"), song("r2", None), song("r3", None)],
             current: 0,
             radio: true,
+            radio_seed: Some("RDAMVMseed".into()),
             ..QueueState::default()
         };
         assert_eq!(enqueue_at(&q), 2);
@@ -6239,7 +6310,7 @@ mod tests {
             song("d", None),
             song("e", None),
         ];
-        let added = merge_radio(&mut items, fresh, existing.clone(), 2, true);
+        let (added, _left) = merge_radio(&mut items, fresh, existing.clone(), 2, true);
         assert_eq!(added, 2); // cap honored: c + d, e cut off
         let ids: Vec<_> = items.iter().map(|i| i.video_id.as_str()).collect();
         assert_eq!(ids, ["a", "b", "c", "d"]);
@@ -6247,7 +6318,7 @@ mod tests {
         assert!(items[2].autoplay && items[3].autoplay);
         assert!(!items[0].autoplay && !items[1].autoplay);
         // Nothing new in the radio result → 0, queue untouched (playback then stops as before).
-        assert_eq!(merge_radio(&mut items.clone(), vec![song("a", None)], existing, 20, true), 0);
+        assert_eq!(merge_radio(&mut items.clone(), vec![song("a", None)], existing, 20, true).0, 0);
     }
 
     #[test]
@@ -6373,20 +6444,20 @@ mod tests {
             next_window: NextWindow::Token("t".into()),
             ..QueueState::default()
         };
-        assert!(!apply_radio_said(&mut q, &NextWindow::Unknown));
+        assert!(!apply_radio_said(&mut q, &NextWindow::Unknown, false));
         assert!(q.radio);
         assert_eq!(q.next_window, NextWindow::Unknown);
 
         // Asked from the seed and learning nothing: not a radio.
         let mut q = QueueState { radio: true, ..QueueState::default() };
-        assert!(apply_radio_said(&mut q, &NextWindow::Unknown));
+        assert!(apply_radio_said(&mut q, &NextWindow::Unknown, false));
         assert!(!q.radio);
 
         // A token and an end are stored as said.
         let mut q = QueueState { radio: true, ..QueueState::default() };
-        assert!(!apply_radio_said(&mut q, &NextWindow::Token("t2".into())));
+        assert!(!apply_radio_said(&mut q, &NextWindow::Token("t2".into()), false));
         assert_eq!(q.next_window, NextWindow::Token("t2".into()));
-        assert!(!apply_radio_said(&mut q, &NextWindow::Ended));
+        assert!(!apply_radio_said(&mut q, &NextWindow::Ended, false));
         assert_eq!(q.next_window, NextWindow::Ended);
     }
 
@@ -6486,9 +6557,15 @@ mod tests {
             token: token.map(str::to_owned),
         };
         // Autoplay: only while the queue is still a queue (not a radio).
+        // `is_radio()` is `radio && seed`, so the negative case pins a seed; a bare
+        // `radio: true` is a half-written queue and reads as *not* a radio on purpose.
         let q = QueueState { radio: false, ..QueueState::default() };
         assert!(window_may_land(&plan(TopUpKind::Autoplay, "RDAMVMa", None), &q, None));
-        let q = QueueState { radio: true, ..QueueState::default() };
+        let q = QueueState {
+            radio: true,
+            radio_seed: Some("RDAMVMa".into()),
+            ..QueueState::default()
+        };
         assert!(!window_may_land(&plan(TopUpKind::Autoplay, "RDAMVMa", None), &q, None));
 
         // Radio: only for the same seed and the same token.
