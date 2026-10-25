@@ -451,7 +451,8 @@ impl QueueState {
 
     /// Drop played rows beyond `keep` from the front, rebasing `current` / `lookahead_loaded` and
     /// removing the same ids from `shuffle_orig` so unshuffle cannot bring them back. Returns how
-    /// many rows went.
+    /// many rows went — informational; `current` is already rebased, so callers must not subtract
+    /// the return value themselves.
     ///
     /// `current < items.len()` is an invariant (every writer of `current` clamps to it), so the
     /// trim is bounded by `current` alone; no `min(len)` is needed.
@@ -5608,7 +5609,8 @@ mod tests {
             q.items.extend((0..20).map(|i| song(&format!("h{hop}-{i}"), None)));
             q.current += 20;
             let playing = q.items[q.current].video_id.clone();
-            q.current -= q.trim_played(KEEP_PLAYED);
+            // `trim_played` rebases `current` internally; its return is informational only.
+            q.trim_played(KEEP_PLAYED);
             assert_eq!(q.items[q.current].video_id, playing);
             assert!(q.items.len() <= KEEP_PLAYED + 21, "grew to {}", q.items.len());
         }
