@@ -1856,6 +1856,12 @@ impl AppState {
                 if q.epoch != epoch {
                     return; // another queue owns the state now: don't touch it, don't persist
                 }
+                // A radio splice replaced the context this fill was walking: the pages have
+                // nowhere to go. Only `Fill::Playing` — `Fill::Queued` appends to the manual
+                // tail, which a splice carries over, so it keeps going.
+                if matches!(fill, Fill::Playing) && is_radio(&q) {
+                    return;
+                }
                 let before = q.items.get(q.current + 1).map(|i| i.video_id.clone());
                 let whole = self.shuffle_whole_queue();
                 append_page(&mut q, items, matches!(fill, Fill::Playing), whole);
@@ -2963,6 +2969,7 @@ impl AppState {
     /// `emit_queue` sees a fresh value and sends only what changed.
     async fn emit_queue_with(&self, force_full: bool) {
         let q = self.queue.lock().await;
+        let radio_ended = is_radio(&q) && matches!(q.radio_state, RadioState::Ended);
         let fingerprint = queue_fingerprint(&q.items);
         let unchanged = self.last_queue_fingerprint.swap(fingerprint, Ordering::Relaxed)
             == fingerprint
@@ -2989,6 +2996,7 @@ impl AppState {
                 "sourceId": &q.source_id,
                 "prevTrack": prev_track_title(&q),
                 "radio": is_radio(&q),
+                "radioEnded": radio_ended,
             })
         };
         let _ = self.app.emit(if unchanged { "queue-index" } else { "queue-changed" }, payload);
@@ -3059,6 +3067,7 @@ impl AppState {
             "sourceId": &q.source_id,
             "prevTrack": prev_track_title(&q),
             "radio": is_radio(&q),
+            "radioEnded": is_radio(&q) && matches!(q.radio_state, RadioState::Ended),
         })
     }
 
@@ -3364,11 +3373,29 @@ impl AppState {
             let added = merge_radio_tagged(&mut q.items, next.items, existing, cap, tag_autoplay);
             let trimmed = if added > 0 { q.trim_played(KEEP_PLAYED) } else { 0 };
             if plan.radio {
+                // The other silent-stop edge: the panel says it has no continuation. Fires once
+                // per radio; after this, `q.radio_state` is `Ended` and `top_up_plan` returns
+                // `None` on every later trigger, so no second line lands.
+                if matches!(window_state, RadioState::Ended)
+                    && !matches!(request_state, RadioState::Ended)
+                {
+                    tracing::info!(
+                        seed = %plan.seed,
+                        "radio panel reports no continuation; radio ended"
+                    );
+                }
                 q.radio_state = window_state.clone();
                 if matches!(window_state, RadioState::Unknown)
                     && matches!(request_state, RadioState::Unknown)
                 {
-                    // A seed-based request returned no token: nothing to continue from.
+                    // A seed-based request returned no token: nothing to continue from. This is
+                    // the only silent-stop mode of the feature (a "panel_token" that misses on
+                    // every page lands here), so it is worth a log line the next report can
+                    // quote. Fires once — after this, `q.radio` is false.
+                    tracing::warn!(
+                        seed = %plan.seed,
+                        "radio top-up returned no continuation on a seed-based window;                          demoting to autoplay"
+                    );
                     q.radio = false;
                     q.radio_seed = None;
                 }
@@ -3379,26 +3406,31 @@ impl AppState {
             let still = is_radio(&q);
             (added, trimmed, still)
         };
-        // A demotion must go out as `queue-changed` (the delta events carry no `radio`). Only a
-        // radio queue can demote, and only on a seed-based `Unknown`. `still_radio` alone is not
-        // enough: for an ordinary queue it is always `false`, which used to force a full emit on
+        // A radio's state change (a demotion, or a first `Ended`) must go out as `queue-changed`:
+        // the delta events carry neither `radio` nor `radioEnded`, so a batch that flips either
+        // would leave the UI showing the old controls. `still_radio` alone is not the demotion
+        // test: for an ordinary queue it is always `false`, which used to force a full emit on
         // every no-op autoplay batch.
         let radio_dropped = plan.radio && !still_radio;
+        let radio_ended = plan.radio && matches!(window_state, RadioState::Ended);
+        let radio_transition = radio_dropped || radio_ended;
         if added > 0 {
             tracing::info!(added, trimmed, seed = %plan.seed, "top-up extended the queue");
-            if trimmed == 0 && !radio_dropped {
-                // No rows moved: a delta is enough. Autoplay keeps its small `queue-appended`.
+            if trimmed == 0 && !radio_transition {
+                // No rows moved and no radio state changed: a delta is enough. Autoplay keeps
+                // its small `queue-appended`.
                 self.emit_queue_appended(added).await;
             } else {
-                // Rows shifted, or the queue demoted: send the whole queue so `radio` rides.
+                // Rows shifted, or a radio state flipped: send the whole queue so the flags ride.
                 self.emit_queue().await;
             }
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
             self.prime_lookahead(gen).await;
-        } else if radio_dropped {
-            // Demoted with no rows to show: the item list is unchanged, so a plain `emit_queue`
-            // would send only `queue-index`, which carries no `radio`. Force the full event.
+        } else if radio_transition {
+            // A radio state flipped with no rows to show: the item list is unchanged, so a plain
+            // `emit_queue` would send only `queue-index`, which carries neither `radio` nor
+            // `radioEnded`. Force the full event.
             self.emit_queue_with(true).await;
             self.persist_queue().await;
             self.lt_broadcast_queue().await;
@@ -4692,8 +4724,6 @@ fn splice_radio_into(
     q.source_name = title;
     q.source_id = None; // a radio is nobody's playlist to edit
     q.radio = true;
-    // Bumped so a fetch already in flight for the replaced queue cannot land on this one.
-    q.epoch += 1;
     // Shuffle is sticky across queues: re-snapshot the new order as the "original", then shuffle
     // what's upcoming (same handling as a radio hydration in `play_song`).
     if q.shuffle_orig.is_some() {

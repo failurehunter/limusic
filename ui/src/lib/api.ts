@@ -107,6 +107,8 @@ export interface QueueState {
 	 *  endless radio continuation). Absent on older backends, in which case the UI keeps its
 	 *  ordinary autoplay controls. */
 	radio?: boolean;
+	/** The radio's panel said it ended: no more top-ups. The queue stops on the current track. */
+	radioEnded?: boolean;
 }
 
 export interface Account {

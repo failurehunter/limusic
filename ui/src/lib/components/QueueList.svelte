@@ -385,7 +385,10 @@
 		{#if view.rows.length}
 			{@render rows(view.rows, wins[0])}
 			<!-- Said once, where the list stops, rather than leaving it to look unfinished. -->
-			{#if canEdit && !playback.queue.radio && !left.count && !view.autoplay.length && !prefs.autoplay && (playback.queue.repeat ?? 'off') === 'off'}
+			<!-- "Queue ends" is right for both an ordinary queue the user has stopped extending
+			     and a radio whose panel said it ended. It is wrong for a radio that is only
+			     momentarily short of tracks — `radioEnded` separates the two. -->
+			{#if canEdit && (playback.queue.radioEnded || (!playback.queue.radio && !prefs.autoplay)) && !left.count && !view.autoplay.length && (playback.queue.repeat ?? 'off') === 'off'}
 				<p class="px-2 pt-3 pb-1 text-xs text-muted-foreground" in:fade={{ duration: 150 }}>
 					{t('player.queue_ends')}
 				</p>
