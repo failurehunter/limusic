@@ -299,29 +299,6 @@ fn identity_snapshot(identity: &AccountIdentity, selected: bool) -> serde_json::
     })
 }
 
-/// Every field a whole-queue replacement sets, except `hydrating`. Baseline `play_song` and
-/// `play_tracks` built this same seven-field block by hand, so a new field had to be added in
-/// two places. `QueueState::install` is the shared writer for those two; `splice_radio_into`,
-/// `restore_context`, `lt_apply_change_track` and `restore_queue` are different operations and
-/// stay as-is.
-///
-/// MUST MATCH `PrevContext` minus `position`: if you add a field here, add it there too (and
-/// vice versa). The compiler catches drift inside `QueueInstall` (exhaustive struct literal,
-/// no `..Default::default()`); the cross-reference between the two structs is by comment.
-///
-/// `shuffle_orig` is passed in rather than computed here: `play_tracks` snapshots before the
-/// carried "Play next" / "Add to queue" adds are spliced in, and `play_song` snapshots after.
-/// The caller knows which.
-struct QueueInstall {
-    items: Vec<SongItem>,
-    current: usize,
-    source_id: Option<String>,
-    source_name: Option<String>,
-    radio_seed: Option<String>,
-    radio: bool,
-    shuffle_orig: Option<Vec<SongItem>>,
-}
-
 #[derive(Default)]
 struct QueueState {
     items: Vec<SongItem>,
@@ -406,23 +383,6 @@ struct PrevContext {
 }
 
 impl QueueState {
-    /// Replace the whole queue. `hydrating` is not set here: it belongs to the caller's flow,
-    /// and setting it in the same `lock` right after install keeps the pair atomic. The epoch
-    /// bump makes an in-flight `fill_playlist` or `extend_queue_radio` for the previous queue
-    /// discard itself.
-    fn install(&mut self, plan: QueueInstall) -> u64 {
-        self.items = plan.items;
-        self.epoch += 1;
-        self.current = plan.current;
-        self.lookahead_loaded = None;
-        self.source_id = plan.source_id;
-        self.radio_seed = plan.radio_seed;
-        self.source_name = plan.source_name;
-        self.radio = plan.radio;
-        self.shuffle_orig = plan.shuffle_orig;
-        self.epoch
-    }
-
     /// Move the play pointer within the same queue.
     fn seek_to(&mut self, index: usize) {
         self.current = index;
@@ -1352,22 +1312,20 @@ impl AppState {
             let shuffled = q.shuffle_orig.is_some();
             q.keep_context(position);
             // No radio behind it, so don't promise one in the header.
-            let source_name = (!no_radio).then(|| format!("{} Radio", seed.title));
-            q.install(QueueInstall {
-                items: vec![seed],
-                current: 0,
-                source_id: None,
-                source_name,
-                radio_seed: None,
-                radio: false, // see PR description: `play_song` is not pinned, #238
-                shuffle_orig: None,
-            });
+            q.source_name = (!no_radio).then(|| format!("{} Radio", seed.title));
+            q.items = vec![seed];
             q.items.append(&mut carried);
+            q.epoch += 1;
+            q.current = 0;
+            q.lookahead_loaded = None;
+            q.radio_seed = None; // single-song queue → autoplay re-seeds from the last track
+            q.source_id = None;
+            q.radio = false;
             // Hold off the autoplay early trigger `start_current` is about to spawn: this queue is
             // one track long, so it would fetch the very radio being hydrated below (#255).
             q.hydrating = (!no_radio).then_some(gen);
-            // Snapshot AFTER carried adds: baseline behavior for `play_song`, kept here. The
-            // `play_tracks` snapshot is BEFORE, and `play_tracks_with` extends it with carried.
+            // Shuffle carries into the new queue only when it's sticky (re-snapshotted after
+            // radio hydration); otherwise a new context starts unshuffled.
             q.shuffle_orig = (sticky && shuffled).then(|| q.items.clone());
         }
 
@@ -1475,25 +1433,6 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
-        self.play_tracks_with(items, start, source_id, source_name, shuffle, continuation, false)
-            .await;
-    }
-
-    /// `play_tracks` plus `radio`. `start_radio` passes `true` so the radio flag is installed
-    /// atomically with the queue instead of patched after — `enqueue_at` reads `radio`, and while
-    /// `play_tracks` is inside `start_current` (seconds of resolve), a manual add would otherwise
-    /// go to the tail of the not-yet-a-radio queue.
-    #[allow(clippy::too_many_arguments)]
-    async fn play_tracks_with(
-        self: &std::sync::Arc<Self>,
-        items: Vec<SongItem>,
-        start: Option<usize>,
-        source_id: Option<String>,
-        source_name: Option<String>,
-        shuffle: bool,
-        continuation: Option<String>,
-        radio: bool,
-    ) {
         if items.is_empty() {
             return;
         }
@@ -1524,33 +1463,28 @@ impl AppState {
             let carried = upcoming_queued(&q.items, q.current);
             // After `keep_shuffled` and `carried`, both of which read what this takes.
             q.keep_context(position);
-            let shuffle_orig = keep_shuffled.then(|| items.clone());
-            let epoch = q.install(QueueInstall {
-                items,
-                current: start,
-                source_id: source_id.clone(),
-                source_name,
-                radio_seed: radio_seed_for(source_id),
-                radio,
-                shuffle_orig,
-            });
+            q.items = items;
+            q.epoch += 1;
+            q.current = start;
+            q.lookahead_loaded = None;
+            q.source_id = source_id.clone();
+            q.radio_seed = radio_seed_for(source_id);
+            q.source_name = source_name;
+            q.radio = false; // a chosen playlist/album; `start_radio` sets it back on for its own
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
             if keep_shuffled {
                 // Snapshot the real playlist order (for un-shuffle), then play the clicked track
                 // first with everything else shuffled behind it. Carried adds are spliced in
                 // after — un-shuffle drops them, same as adds made while shuffled (snapshot
                 // semantics, see toggle_shuffle).
-                let s = q.current;
-                q.current = shuffle_new_queue(&mut q.items, s);
+                q.shuffle_orig = Some(q.items.clone());
+                let start = q.current;
+                q.current = shuffle_new_queue(&mut q.items, start);
+            } else {
+                q.shuffle_orig = None; // non-sticky shuffle ends with the queue it was turned on for
             }
             // Carried adds keep their meaning in the new queue: Play next right after the clicked
             // track, Add to queue behind the new playlist (#369).
-            // The carried adds join the un-shuffle snapshot too: un-shuffle should not delete
-            // what the user put in the queue. Baseline `play_tracks` did not do this, so an
-            // un-shuffle there lost carried adds; fixed here for both callers.
-            if let Some(o) = q.shuffle_orig.as_mut() {
-                o.extend(carried.iter().cloned());
-            }
             let (next, added): (Vec<_>, Vec<_>) = carried.into_iter().partition(|i| i.queued);
             let at = q.current + 1;
             q.items.splice(at..at, next);
@@ -1560,7 +1494,7 @@ impl AppState {
                 let cur = q.current;
                 shuffle_upcoming(&mut q.items, cur, true);
             }
-            epoch
+            q.epoch
         };
         // start_current emits now-playing + queue + persists; prime the gapless lookahead after.
         if self.start_current(gen).await {
@@ -1647,15 +1581,8 @@ impl AppState {
             self.splice_radio(items, seed, title).await;
             return Ok(());
         }
-        // Installed as a radio atomically with the queue. Baseline patched `q.radio = true` after
-        // `play_tracks` returned; while `play_tracks` was inside `start_current`, a manual add
-        // through `enqueue_at` saw `radio = false` and went to the tail instead of the "before
-        // autoplay" slot.
-        self.play_tracks_with(
-            items, Some(seed_at.unwrap_or(0)), Some(seed), title, false, None,
-            true, // radio
-        )
-        .await;
+        self.play_tracks(items, Some(seed_at.unwrap_or(0)), Some(seed), title, false, None).await;
+        self.queue.lock().await.radio = true;
         Ok(())
     }
 
