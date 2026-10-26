@@ -299,25 +299,6 @@ fn identity_snapshot(identity: &AccountIdentity, selected: bool) -> serde_json::
     })
 }
 
-/// The fields every whole-queue replacement must set. Baseline `play_song` and `play_tracks` built
-/// this same eight-field block by hand, so a new field (`radio`, `hydrating`, `radio_state` in the
-/// feature branch) had to be added twice and could be forgotten in one. `QueueState::install` is
-/// the only writer now.
-///
-/// `shuffle_orig` is passed in rather than computed here: `play_tracks` snapshots before the
-/// carried "Play next" / "Add to queue" adds are spliced in (un-shuffle drops them — snapshot
-/// semantics, see `toggle_shuffle`); the caller knows whether to snapshot before or after.
-struct QueueInstall {
-    items: Vec<SongItem>,
-    current: usize,
-    source_id: Option<String>,
-    source_name: Option<String>,
-    radio_seed: Option<String>,
-    radio: bool,
-    hydrating: Option<u64>,
-    shuffle_orig: Option<Vec<SongItem>>,
-}
-
 #[derive(Default)]
 struct QueueState {
     items: Vec<SongItem>,
@@ -402,23 +383,6 @@ struct PrevContext {
 }
 
 impl QueueState {
-    /// Replace the whole queue. The only caller-visible effect besides the fields is the epoch
-    /// bump: an in-flight `fill_playlist` or `extend_queue_radio` for the previous queue is
-    /// discarded by its `q.epoch != epoch` check.
-    fn install(&mut self, plan: QueueInstall) -> u64 {
-        self.items = plan.items;
-        self.epoch += 1;
-        self.current = plan.current;
-        self.lookahead_loaded = None;
-        self.source_id = plan.source_id;
-        self.radio_seed = plan.radio_seed;
-        self.source_name = plan.source_name;
-        self.radio = plan.radio;
-        self.hydrating = plan.hydrating;
-        self.shuffle_orig = plan.shuffle_orig;
-        self.epoch
-    }
-
     /// Move the play pointer within the same queue.
     fn seek_to(&mut self, index: usize) {
         self.current = index;
@@ -1328,34 +1292,50 @@ impl AppState {
             self.lt.suggest(song_to_track(&seed)).await;
             return;
         }
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let video_id = seed.video_id.clone();
+        let sticky = self.sticky_shuffle();
 
         // A local file isn't a videoId YouTube has ever heard of: it has no radio, and asking for
         // one offline (where local music earns its keep) is a guaranteed-failing request.
         // Autoplay off means the song plays and the queue ends there (#238): the radio hydrated
         // below is exactly the "recommended tracks" that setting turns off.
         let no_radio = crate::local::is_local_song(&video_id) || !self.autoplay_enabled();
-        let source_name = (!no_radio).then(|| format!("{} Radio", seed.title));
-        // `!no_radio` marks this generation as hydrating: `play_tracks_with` sets `q.hydrating` so
-        // the autoplay early trigger cannot race the `next()` below (issue #255). `end_hydration`
-        // is called after the merge, or on `start_current` failure inside `play_tracks_with`.
-        let Some(gen) = self
-            .play_tracks_with(
-                vec![seed],
-                Some(0),
-                None,
-                source_name,
-                false,     // shuffle
-                None,      // continuation
-                false,     // radio
-                !no_radio, // hydrating
-            )
-            .await
-        else {
+        let position = self.current_position();
+
+        {
+            let mut q = self.queue.lock().await;
+            // Unplayed manual adds survive a context switch (Spotify semantics): they follow the
+            // new track, ahead of its radio (hydration appends behind them).
+            let mut carried = upcoming_queued(&q.items, q.current);
+            // Both of these read what `keep_context` is about to take, so they go before it.
+            let shuffled = q.shuffle_orig.is_some();
+            q.keep_context(position);
+            // No radio behind it, so don't promise one in the header.
+            q.source_name = (!no_radio).then(|| format!("{} Radio", seed.title));
+            q.items = vec![seed];
+            q.items.append(&mut carried);
+            q.epoch += 1;
+            q.current = 0;
+            q.lookahead_loaded = None;
+            q.radio_seed = None; // single-song queue → autoplay re-seeds from the last track
+            q.source_id = None;
+            q.radio = false;
+            // Hold off the autoplay early trigger `start_current` is about to spawn: this queue is
+            // one track long, so it would fetch the very radio being hydrated below (#255).
+            q.hydrating = (!no_radio).then_some(gen);
+            // Shuffle carries into the new queue only when it's sticky (re-snapshotted after
+            // radio hydration); otherwise a new context starts unshuffled.
+            q.shuffle_orig = (sticky && shuffled).then(|| q.items.clone());
+        }
+
+        if !self.start_current(gen).await {
+            self.end_hydration(gen).await;
             return;
-        };
+        }
 
         if no_radio {
+            self.prime_lookahead(gen).await;
             return;
         }
 
@@ -1453,51 +1433,12 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
-        self.play_tracks_with(
-            items,
-            start,
-            source_id,
-            source_name,
-            shuffle,
-            continuation,
-            false, // radio
-            false, // hydrating
-        )
-        .await;
-    }
-
-    /// `play_tracks` plus the two things `play_song` also needs: a `radio` flag (so `start_radio`
-    /// installs the radio atomically with the queue instead of patching `q.radio = true` after
-    /// `play_tracks` returns — that post-patch is a baseline race, since `start_current` spawns
-    /// `extend_queue_radio` under `radio = false` for the first few seconds) and a `hydrating` flag
-    /// (so the fresh-`next` hydration in `play_song` blocks the autoplay early trigger until its
-    /// page is applied, without having to build a second install path). Answers the queue
-    /// generation on success, `None` if `start_current` could not start the first track.
-    ///
-    /// Small behavior change vs baseline `play_song`: `shuffle_orig` is computed from `items`
-    /// **before** carried adds are spliced in, matching `play_tracks`. Baseline `play_song` computed
-    /// it after (`shuffle_orig = [seed] + carried`), so un-shuffle kept carried adds; through this
-    /// path it drops them, snapshot semantics — the documented `toggle_shuffle` rule. Called out so
-    /// a reviewer sees it; if you want to keep the old behavior, restore the after-carried snapshot
-    /// for the `hydrating = true` case only.
-    #[allow(clippy::too_many_arguments)]
-    async fn play_tracks_with(
-        self: &std::sync::Arc<Self>,
-        items: Vec<SongItem>,
-        start: Option<usize>,
-        source_id: Option<String>,
-        source_name: Option<String>,
-        shuffle: bool,
-        continuation: Option<String>,
-        radio: bool,
-        hydrating: bool,
-    ) -> Option<u64> {
         if items.is_empty() {
-            return None;
+            return;
         }
         if self.lt.is_guest().await {
             self.emit_guest_hint();
-            return None;
+            return;
         }
         // A mix has no "rest of the playlist" worth walking (see `is_mix`) — drop the token.
         let continuation = continuation.filter(|_| !is_mix(source_id.as_deref()));
@@ -1522,24 +1463,25 @@ impl AppState {
             let carried = upcoming_queued(&q.items, q.current);
             // After `keep_shuffled` and `carried`, both of which read what this takes.
             q.keep_context(position);
-            let shuffle_orig = keep_shuffled.then(|| items.clone());
-            let epoch = q.install(QueueInstall {
-                items,
-                current: start,
-                source_id: source_id.clone(),
-                source_name,
-                radio_seed: radio_seed_for(source_id),
-                radio,
-                hydrating: hydrating.then_some(gen),
-                shuffle_orig,
-            });
+            q.items = items;
+            q.epoch += 1;
+            q.current = start;
+            q.lookahead_loaded = None;
+            q.source_id = source_id.clone();
+            q.radio_seed = radio_seed_for(source_id);
+            q.source_name = source_name;
+            q.radio = false; // a chosen playlist/album; `start_radio` sets it back on for its own
+            q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
             if keep_shuffled {
                 // Snapshot the real playlist order (for un-shuffle), then play the clicked track
                 // first with everything else shuffled behind it. Carried adds are spliced in
                 // after — un-shuffle drops them, same as adds made while shuffled (snapshot
                 // semantics, see toggle_shuffle).
-                let s = q.current;
-                q.current = shuffle_new_queue(&mut q.items, s);
+                q.shuffle_orig = Some(q.items.clone());
+                let start = q.current;
+                q.current = shuffle_new_queue(&mut q.items, start);
+            } else {
+                q.shuffle_orig = None; // non-sticky shuffle ends with the queue it was turned on for
             }
             // Carried adds keep their meaning in the new queue: Play next right after the clicked
             // track, Add to queue behind the new playlist (#369).
@@ -1552,19 +1494,16 @@ impl AppState {
                 let cur = q.current;
                 shuffle_upcoming(&mut q.items, cur, true);
             }
-            epoch
+            q.epoch
         };
         // start_current emits now-playing + queue + persists; prime the gapless lookahead after.
-        if !self.start_current(gen).await {
-            self.end_hydration(gen).await;
-            return None;
+        if self.start_current(gen).await {
+            self.prime_lookahead(gen).await;
         }
-        self.prime_lookahead(gen).await;
         if let Some(token) = continuation {
             let me = self.clone();
             tokio::spawn(async move { me.fill_playlist(epoch, gen, token, Fill::Playing).await });
         }
-        Some(gen)
     }
 
     /// Start a radio (context/08): an endless YouTube-generated queue seeded on a song, artist,
@@ -1642,20 +1581,8 @@ impl AppState {
             self.splice_radio(items, seed, title).await;
             return Ok(());
         }
-        // Installed as a radio atomically with the queue. Baseline patched `q.radio = true` after
-        // `play_tracks` returned, which left `extend_queue_radio` (spawned from `start_current` under
-        // `play_tracks`) treating the fresh radio as autoplay for the first few seconds.
-        self.play_tracks_with(
-            items,
-            Some(seed_at.unwrap_or(0)),
-            Some(seed),
-            title,
-            false,
-            None,
-            true,  // radio
-            false, // hydrating
-        )
-        .await;
+        self.play_tracks(items, Some(seed_at.unwrap_or(0)), Some(seed), title, false, None).await;
+        self.queue.lock().await.radio = true;
         Ok(())
     }
 
