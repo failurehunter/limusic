@@ -255,14 +255,19 @@ impl InnerTube {
             is_audio_only: true,
         };
         let value = self.post("next", metadata_client, &body, true).await?;
-        let mut next = metadata::parse_next(&value);
-        // The seed itself survives: "start radio from this video" must still open on that video,
-        // and the track already playing is never yanked out from under the user.
+        Ok(self.filter_next(metadata::parse_next(&value), video_id))
+    }
+
+    /// Apply the two fetch-boundary filters a `next` page goes through: "hide music videos" and
+    /// the blocked-artist list. `seed` is the video `next` was asked about, which survives both
+    /// (a seed can't be yanked out from under the user); `None` for a radio page, which has no
+    /// seed of its own.
+    fn filter_next(&self, mut next: NextResult, seed: Option<&str>) -> NextResult {
         if self.hide_videos() {
-            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == video_id);
+            next.items.retain(|i| !i.is_video || Some(i.video_id.as_str()) == seed);
         }
-        self.drop_blocked_songs(&mut next.items, video_id);
-        Ok(next)
+        self.drop_blocked_songs(&mut next.items, seed);
+        next
     }
 
     /// The next page of the same radio/panel, by the continuation token the previous page carried
@@ -280,12 +285,7 @@ impl InnerTube {
         }
         let body = ContinuousBody { context: self.context_for(metadata_client), continuation: token };
         let value = self.post("next", metadata_client, &body, true).await?;
-        let mut next = metadata::parse_next(&value);
-        if self.hide_videos() {
-            next.items.retain(|i| !i.is_video);
-        }
-        self.drop_blocked_songs(&mut next.items, None);
-        Ok(next)
+        Ok(self.filter_next(metadata::parse_next(&value), None))
     }
 
     // --- comments. Reads go through `next`: a comments token sent to `browse` is answered with

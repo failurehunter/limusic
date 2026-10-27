@@ -2143,12 +2143,16 @@ mod tests {
                 "continuations": [{
                     "nextRadioContinuationData": { "continuation": "TOKEN2" }
                 }]
-            }}
+            }},
+            // A decoy: another tab's continuation, alphabetically after the panel's.
+            "tabs": [{ "tabRenderer": { "continuations": [{
+                "reloadContinuationData": { "continuation": "DECOY_TAB_TOKEN" }
+            }]}}]
         });
         let out = parse_next(&root);
         assert_eq!(out.items.len(), 2);
         assert_eq!(out.items[0].video_id, "vid_a");
         assert_eq!(out.items[1].video_id, "vid_b");
-        assert_eq!(out.continuation.as_deref(), Some("TOKEN2"));
+        assert_eq!(out.continuation.as_deref(), Some("TOKEN2"), "не токен вкладки");
     }
 }
