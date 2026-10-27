@@ -265,6 +265,29 @@ impl InnerTube {
         Ok(next)
     }
 
+    /// The next page of the same radio/panel, by the continuation token the previous page carried
+    /// ([`NextResult::continuation`]). This is how a radio walks its own list — `next` with the
+    /// seed again returns a fresh window around that seed, not the page that follows.
+    pub async fn radio_continuation(
+        &self,
+        metadata_client: &YouTubeClient,
+        token: &str,
+    ) -> Result<NextResult, Error> {
+        #[derive(Serialize)]
+        struct ContinuousBody<'a> {
+            context: Context,
+            continuation: &'a str,
+        }
+        let body = ContinuousBody { context: self.context_for(metadata_client), continuation: token };
+        let value = self.post("next", metadata_client, &body, true).await?;
+        let mut next = metadata::parse_next(&value);
+        if self.hide_videos() {
+            next.items.retain(|i| !i.is_video);
+        }
+        self.drop_blocked_songs(&mut next.items, None);
+        Ok(next)
+    }
+
     // --- comments. Reads go through `next`: a comments token sent to `browse` is answered with
     // the Home feed. -----------------------------------------------------------------------
 
@@ -2333,5 +2356,45 @@ mod tests {
             assert!(body.get("context").is_some());
             assert!(as_account(&sent[0]), "an action is the account's own");
         }
+    }
+
+    /// `radio_continuation` is an ordinary `POST next` carrying `continuation` and no
+    /// `videoId`/`playlistId`: a page of the list, not a new window around the seed. The answer
+    /// comes under `continuationContents.playlistPanelContinuation.contents`, and its next token
+    /// sits in `nextRadioContinuationData.continuation`.
+    #[tokio::test]
+    async fn radio_continuation_posts_the_token_as_continuation() {
+        let server = MockServer::start(|_req: &Seen| {
+            (
+                200,
+                json!({
+                    "continuationContents": { "playlistPanelContinuation": {
+                        "contents": [
+                            { "playlistPanelVideoRenderer": {
+                                "videoId": "vid_a",
+                                "title": { "runs": [{ "text": "Song A" }] },
+                                "longBylineText": { "runs": [{ "text": "Artist A" }] }
+                            }}
+                        ],
+                        "continuations": [{
+                            "nextRadioContinuationData": { "continuation": "TOK2" }
+                        }]
+                    }}
+                })
+                .to_string(),
+            )
+        });
+        let it = it_against(&server, false);
+        let page = it.radio_continuation(&web(), "TOK1").await.unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].video_id, "vid_a");
+        assert_eq!(page.continuation.as_deref(), Some("TOK2"));
+        let sent = server.requests();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].path.starts_with("/youtubei/v1/next"));
+        let body: serde_json::Value = serde_json::from_str(&sent[0].body).unwrap();
+        assert_eq!(body["continuation"], "TOK1", "токен ушёл именно в continuation");
+        assert!(body.get("videoId").is_none(), "это страница, а не новое окно");
+        assert!(body.get("playlistId").is_none());
     }
 }

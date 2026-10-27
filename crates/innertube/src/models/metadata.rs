@@ -2119,4 +2119,36 @@ mod tests {
             None
         );
     }
+
+    /// A continuation page arrives under `continuationContents.playlistPanelContinuation`, not
+    /// under `contents.playlistPanelRenderer.contents`, and its next token lives in
+    /// `nextRadioContinuationData.continuation` (not `nextContinuationData`). `parse_next` has to
+    /// find both — otherwise `extend_queue_radio` can't walk the list past the first page.
+    #[test]
+    fn parses_a_radio_continuation_page() {
+        let root = json!({
+            "continuationContents": { "playlistPanelContinuation": {
+                "contents": [
+                    { "playlistPanelVideoRenderer": {
+                        "videoId": "vid_a",
+                        "title": { "runs": [{ "text": "Song A" }] },
+                        "longBylineText": { "runs": [{ "text": "Artist A" }] }
+                    }},
+                    { "playlistPanelVideoRenderer": {
+                        "videoId": "vid_b",
+                        "title": { "runs": [{ "text": "Song B" }] },
+                        "longBylineText": { "runs": [{ "text": "Artist B" }] }
+                    }}
+                ],
+                "continuations": [{
+                    "nextRadioContinuationData": { "continuation": "TOKEN2" }
+                }]
+            }}
+        });
+        let out = parse_next(&root);
+        assert_eq!(out.items.len(), 2);
+        assert_eq!(out.items[0].video_id, "vid_a");
+        assert_eq!(out.items[1].video_id, "vid_b");
+        assert_eq!(out.continuation.as_deref(), Some("TOKEN2"));
+    }
 }
