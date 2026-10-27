@@ -1427,6 +1427,8 @@ impl AppState {
 
     /// Play a finite list of tracks (a playlist/album). `start` is the clicked track; `None`
     /// means "just play the playlist" (the header Play button) — first track, or any track when
+    /// Play a finite list of tracks (a playlist/album). `start` is the clicked track; `None`
+    /// means "just play the playlist" (the header Play button) — first track, or any track when
     /// shuffle is on. Unlike `play_song` this seeds NO radio — the given items *are* the queue
     /// (context/08: playlist playback). `source_id` (the page's playlist/album playlist id) makes
     /// autoplay continue with that context's radio when the queue runs out. `source_name` is the
@@ -1438,6 +1440,12 @@ impl AppState {
     /// from the tracks the page had loaded and the rest is walked in the background
     /// ([`Self::fill_playlist`]) so a long playlist starts playing now instead of after ~50
     /// chained round trips.
+    ///
+    /// `radio`/`radio_token` mark a `start_radio` queue (`radio = true`, token carries the first
+    /// page's continuation if any). `false, None` for every other queue: the invariant is
+    /// "token meaningful only when radio", and installing both under the queue lock removes the
+    /// race with `extend_queue_radio`'s spawn inside `start_current`. External callers pass
+    /// `false, None`.
     #[allow(clippy::too_many_arguments)]
     pub async fn play_tracks(
         self: &std::sync::Arc<Self>,
@@ -1447,11 +1455,6 @@ impl AppState {
         source_name: Option<String>,
         shuffle: bool,
         continuation: Option<String>,
-        /// Queue is a `start_radio`: `radio = true`, and `radio_token` carries the first page's
-        /// continuation (if any). `false, None` for every other queue. Two arguments rather than
-        /// one because the invariant is "token meaningful only when radio", and installing them
-        /// together under the queue lock is what removes the race with `extend_queue_radio`'s
-        /// spawn inside `start_current`. External callers (commands) must pass `false, None`.
         radio: bool,
         radio_token: Option<String>,
     ) {
@@ -3082,7 +3085,7 @@ impl AppState {
         if self.lt.is_guest().await {
             return 0;
         }
-        let (last_video, seed, token, radio) = {
+        let (last_video, seed, token, _radio) = {
             let mut q = self.queue.lock().await;
             if q.hydrating == Some(gen) || q.radio_topup == Some(gen) {
                 // This queue's own fetch is already in flight (#255): `play_song`'s hydration, or
