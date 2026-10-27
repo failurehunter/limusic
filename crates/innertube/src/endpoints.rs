@@ -265,6 +265,26 @@ impl InnerTube {
         Ok(next)
     }
 
+    /// One window of an endless radio, by the panel token the previous page carried.
+    ///
+    /// Uses [`Self::next_continuation`] so the token goes back the same way it came: signed in,
+    /// as the account through `post_no_heal` (a background top-up must not wake the session
+    /// healer); signed out, anonymously. Same hide-videos and blocked-artist filtering as
+    /// [`Self::next`], minus the seed exception — a continuation page has no single anchor.
+    pub async fn radio_continuation(
+        &self,
+        client: &YouTubeClient,
+        token: &str,
+    ) -> Result<NextResult, Error> {
+        let value = self.next_continuation(client, token, self.is_logged_in()).await?;
+        let mut next = metadata::parse_next(&value);
+        if self.hide_videos() {
+            next.items.retain(|i| !i.is_video);
+        }
+        self.drop_blocked_songs(&mut next.items, None);
+        Ok(next)
+    }
+
     // --- comments. Reads go through `next`: a comments token sent to `browse` is answered with
     // the Home feed. -----------------------------------------------------------------------
 

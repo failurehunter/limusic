@@ -325,9 +325,9 @@ pub fn parse_next(root: &Value) -> NextResult {
             items.push(item);
         }
     }
-    // The automix/radio continuation (context/08): the panel ends with a continuation token
-    // used to fetch the endless mix. Take the first continuation token we find.
-    let continuation = find_first_str(root, "continuation");
+    // The panel's own continuation token, not the first `continuation` in the tree — a comments
+    // or Related continuation would page the wrong list. See `panel_token`.
+    let continuation = panel_token(root);
     let automix_playlist_id = find_all(root, "automixPreviewVideoRenderer")
         .into_iter()
         .find_map(|n| find_first_str(n, "playlistId"));
@@ -340,6 +340,25 @@ pub fn parse_next(root: &Value) -> NextResult {
         // read whatever a future panel row starts carrying instead of the requested video's own.
         rating: root.get("playerOverlays").and_then(like_status),
     }
+}
+
+/// The playlist panel's own continuation token, if it carries one.
+///
+/// `find_first_str(root, "continuation")` takes whatever comes first in the JSON — the comments
+/// panel's token, Related's, the lyrics tab's — and a top-up that followed one would page a
+/// different list entirely. Scoped to the first `playlistPanelRenderer` / `playlistPanelContinuation`.
+/// Inside it, `nextRadioContinuationData` is the radio's own token; `nextContinuationData` is the
+/// fallback for a plain playlist continuation.
+fn panel_token(root: &Value) -> Option<String> {
+    let panel = find_all(root, "playlistPanelRenderer")
+        .into_iter()
+        .next()
+        .or_else(|| find_all(root, "playlistPanelContinuation").into_iter().next())?;
+    ["nextRadioContinuationData", "nextContinuationData"].into_iter().find_map(|key| {
+        find_all(panel, key)
+            .into_iter()
+            .find_map(|d| d.get("continuation").and_then(Value::as_str).map(str::to_owned))
+    })
 }
 
 /// Every panel row in order, ignoring the `counterpart` arm of a
@@ -1233,6 +1252,36 @@ pub(crate) fn find_first_str(root: &Value, key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn panel_token_reads_the_panel_not_the_tree() {
+        // A radio's own token inside the panel wins over any continuation elsewhere in the tree.
+        let v = json!({
+            "contents": { "playlistPanelRenderer": {
+                "contents": [],
+                "continuations": [{ "nextRadioContinuationData": { "continuation": "PANEL" } }],
+            } },
+            "comments": { "continuations": [
+                { "nextContinuationData": { "continuation": "COMMENT" } },
+            ] },
+        });
+        assert_eq!(panel_token(&v), Some("PANEL".into()));
+        // `nextContinuationData` is the plain fallback inside the panel.
+        let v = json!({
+            "contents": { "playlistPanelRenderer": {
+                "contents": [],
+                "continuations": [{ "nextContinuationData": { "continuation": "PLAIN" } }],
+            } },
+        });
+        assert_eq!(panel_token(&v), Some("PLAIN".into()));
+        // No panel: nothing, even when other parts of the response carry a token.
+        let v = json!({
+            "comments": { "continuations": [
+                { "nextContinuationData": { "continuation": "X" } },
+            ] },
+        });
+        assert_eq!(panel_token(&v), None);
+    }
 
     // The whole "hide music videos" feature is this predicate, and the way it fails is silent: a
     // wrong JSON path reads `None` everywhere, the filter quietly becomes a no-op, and the setting

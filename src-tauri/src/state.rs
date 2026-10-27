@@ -346,6 +346,12 @@ struct QueueState {
     /// seed track, so without this hold both paths request the same `RDAMVM…` page at the same
     /// moment and the queue ends up holding it twice (issue #255).
     hydrating: Option<u64>,
+    /// Panel continuation token for the current radio's next window. Transient: never persisted,
+    /// never carried in `PrevContext`. Cleared by `install` (whole queue) and by every caller that
+    /// resets `radio_seed` (`restore_context`, `lt_apply_change_track`, `restore_queue`). A radio
+    /// with no token (bare seed page, restore) falls back to the baseline reseed in
+    /// `extend_queue_radio`.
+    radio_token: Option<String>,
     /// The queue index we've already appended to mpv for gapless lookahead (if any).
     lookahead_loaded: Option<usize>,
     /// Which client served the currently-loaded track (for the WEB_REMIX-403 feedback). context/06.
@@ -417,6 +423,9 @@ impl QueueState {
         self.source_name = plan.source_name;
         self.radio = plan.radio;
         self.shuffle_orig = plan.shuffle_orig;
+        // A token belongs to the page we were on; a new whole queue has none yet. `play_tracks_with`
+        // re-installs one for `start_radio`; `play_song` installs one after radio hydration.
+        self.radio_token = None;
     }
 
     /// Move the play pointer within the same queue.
@@ -469,6 +478,8 @@ impl QueueState {
         self.source_name = prev.source_name;
         self.source_id = prev.source_id;
         self.radio = prev.radio;
+        // A token was not part of the snapshot: the restored queue reseeds on its first top-up.
+        self.radio_token = None;
         self.lookahead_loaded = None; // mpv's primed next belongs to the queue we just dropped
         self.hydrating = None; // as does any radio still being fetched for it
         self.retried = None;
@@ -1435,6 +1446,12 @@ impl AppState {
                     }
                     self.lastfm.set_album(&video_id, album);
                 }
+                // Keep the panel's continuation, so the next top-up is a new window rather than
+                // another request for this same first page. `radio` stays `false` (see
+                // `QueueInstall` above) — the flag drives `enqueue_at`, not the token.
+                if let Some(c) = next.continuation.take() {
+                    q.radio_token = Some(c);
+                }
                 // Shuffle on → the radio hydration is part of the queue: snapshot it as the
                 // "original" order, then shuffle the upcoming tracks. (Runs before the lookahead
                 // is primed, so nothing stale is in mpv.)
@@ -1475,8 +1492,12 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
     ) {
-        self.play_tracks_with(items, start, source_id, source_name, shuffle, continuation, false)
-            .await;
+        self.play_tracks_with(
+            items, start, source_id, source_name, shuffle, continuation,
+            false, // radio
+            None,  // radio_token
+        )
+        .await;
     }
 
     /// [`Self::play_tracks`] plus `radio`, installed with the queue. `start_radio` used to set it
@@ -1492,6 +1513,7 @@ impl AppState {
         shuffle: bool,
         continuation: Option<String>,
         radio: bool,
+        radio_token: Option<String>,
     ) {
         if items.is_empty() {
             return;
@@ -1536,6 +1558,7 @@ impl AppState {
                 shuffle_orig,
             });
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
+            q.radio_token = radio_token; // `None` for `play_tracks`, `Some(t)` for `start_radio`
             if keep_shuffled {
                 // Play the clicked track first with everything else shuffled behind it.
                 let start = q.current;
@@ -1625,7 +1648,8 @@ impl AppState {
             other => return Err(format!("unknown radio kind: {other}")),
         };
 
-        let (mut items, seed) = self.fetch_radio(video_id.as_deref(), &playlist_id).await?;
+        let (mut items, seed, continuation) =
+            self.fetch_radio(video_id.as_deref(), &playlist_id).await?;
         // The seed song comes back inside the first page (usually first, but the panel decides):
         // start there so a radio on song X actually opens on X. Only what follows it is reordered,
         // and a radio with no seed song (artist, album, playlist) is reordered whole.
@@ -1640,7 +1664,7 @@ impl AppState {
             video_id.is_some() && q.items.get(q.current).map(|i| &i.video_id) == video_id.as_ref()
         };
         if playing_seed && !self.player.is_idle() {
-            self.splice_radio(items, seed, title).await;
+            self.splice_radio(items, seed, title, continuation).await;
             return Ok(());
         }
         self.play_tracks_with(
@@ -1651,6 +1675,7 @@ impl AppState {
             false,
             None,
             true, // radio, installed with the queue
+            continuation, // the panel's own token, installed with the queue
         )
         .await;
         Ok(())
@@ -1671,13 +1696,13 @@ impl AppState {
         &self,
         video_id: Option<&str>,
         playlist_id: &str,
-    ) -> Result<(Vec<SongItem>, String), String> {
+    ) -> Result<(Vec<SongItem>, String, Option<String>), String> {
         const NO_RADIO: &str = "YouTube has no radio for this.";
         let client = self.clients.get(innertube::METADATA_CLIENT).ok_or("no metadata client")?;
         let first =
             self.it.next(client, video_id, Some(playlist_id)).await.map_err(|e| e.to_string())?;
         if first.items.len() > 1 {
-            return Ok((first.items, playlist_id.to_owned()));
+            return Ok((first.items, playlist_id.to_owned(), first.continuation));
         }
         let Some(video_id) = video_id else { return Err(NO_RADIO.into()) };
         let bare = self.it.next(client, Some(video_id), None).await.map_err(|e| e.to_string())?;
@@ -1688,11 +1713,13 @@ impl AppState {
                 .await
                 .map_err(|e| e.to_string())?;
             if page.items.len() > 1 {
-                return Ok((page.items, mix));
+                return Ok((page.items, mix, page.continuation));
             }
         }
         if bare.items.len() > 1 {
-            return Ok((bare.items, format!("RDAMVM{video_id}")));
+            // A bare page's continuation is not known to belong to a radio panel: no token, the
+            // first top-up reseeds.
+            return Ok((bare.items, format!("RDAMVM{video_id}"), None));
         }
         Err(NO_RADIO.into())
     }
@@ -1706,13 +1733,14 @@ impl AppState {
         items: Vec<SongItem>,
         seed: String,
         title: Option<String>,
+        token: Option<String>,
     ) {
         {
             let mut q = self.queue.lock().await;
             if !self.sticky_shuffle() {
                 q.shuffle_orig = None; // a radio is a new context, so a non-sticky shuffle ends here
             }
-            splice_radio_into(&mut q, items, seed, title);
+            splice_radio_into(&mut q, items, seed, title, token);
             // Whatever mpv had primed as the gapless next belongs to the old queue.
             if q.lookahead_loaded.take().is_some() {
                 let _ = self.player.clear_playlist();
@@ -3100,7 +3128,7 @@ impl AppState {
         if !self.autoplay_enabled() || self.lt.is_guest().await {
             return 0;
         }
-        let (last_video, seed) = {
+        let (last_video, seed, token, original_seed) = {
             let q = self.queue.lock().await;
             if q.hydrating == Some(gen) {
                 // This queue's own `play_song` is already fetching its radio (#255). Keyed to the
@@ -3122,21 +3150,47 @@ impl AppState {
                 return 0;
             }
             let seed = q.radio_seed.clone().unwrap_or_else(|| format!("RDAMVM{}", last.video_id));
-            (last.video_id.clone(), seed)
+            (
+                last.video_id.clone(),
+                seed,
+                q.radio_token.clone(),
+                q.radio_seed.clone(),
+            )
         };
         let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return 0 };
-        // Snapshot → network → re-lock, same discipline as `prime_lookahead`; the generation check
-        // between them is what makes it safe, and `absorb_radio` dedupes against the queue as it
-        // is after the fetch, so whatever grew it meanwhile can't come back as a duplicate.
-        let fresh = match self.it.next(client, Some(&last_video), Some(&seed)).await {
-            Ok(next) => next.items,
-            Err(e) => {
-                tracing::warn!(error = %e, "autoplay radio fetch failed");
-                return 0;
+        // Follow the token when we have one — that is what makes the radio endless instead of
+        // `next(anchor, seed)` returning the same first page every hop. Without one (bare seed
+        // page, restored queue, or after a failure) fall back to the baseline reseed.
+        let (fresh, next_token) = if let Some(t) = &token {
+            match self.it.radio_continuation(client, t).await {
+                Ok(n) => (n.items, n.continuation),
+                Err(e) => {
+                    tracing::warn!(error = %e, "radio continuation failed; reseeding next time");
+                    let mut q = self.queue.lock().await;
+                    if q.radio_seed == original_seed {
+                        q.radio_token = None;
+                    }
+                    return 0;
+                }
+            }
+        } else {
+            match self.it.next(client, Some(&last_video), Some(&seed)).await {
+                Ok(n) => (n.items, n.continuation),
+                Err(e) => {
+                    tracing::warn!(error = %e, "autoplay radio fetch failed");
+                    return 0;
+                }
             }
         };
-        let added = self.absorb_radio(fresh, gen, &seed, AUTOPLAY_BATCH).await;
-        if added > 0 {
+        // A continuation page is entirely new rows — cutting it by 20 would lose the tail
+        // (dedupe on the same token next time yields 0). Autoplay keeps its batch.
+        let cap = if token.is_some() { usize::MAX } else { AUTOPLAY_BATCH };
+        let added =
+            self.absorb_radio(fresh, gen, &seed, cap, next_token, original_seed.clone()).await;
+        // A successful token page added rows; escalation to `fetch_radio` is only for the
+        // blocked-artist zero case (all rows filtered), and a token page has no "first page
+        // shape" to escalate away from.
+        if added > 0 || token.is_some() {
             return added;
         }
         // A radio window can come back entirely blocked. Re-requesting the same seed from the same
@@ -3151,10 +3205,10 @@ impl AppState {
             return 0;
         }
         let song_seed = format!("RDAMVM{last_video}");
-        let Ok((fresh, seed)) = self.fetch_radio(Some(&last_video), &song_seed).await else {
+        let Ok((fresh, seed, _tok)) = self.fetch_radio(Some(&last_video), &song_seed).await else {
             return 0;
         };
-        self.absorb_radio(fresh, gen, &seed, AUTOPLAY_BATCH).await
+        self.absorb_radio(fresh, gen, &seed, AUTOPLAY_BATCH, None, original_seed).await
     }
 
     /// Append a fetched radio page to the tail of the queue and run the bookkeeping that follows.
@@ -3166,6 +3220,8 @@ impl AppState {
         gen: u64,
         seed: &str,
         cap: usize,
+        next_token: Option<String>,
+        original_seed: Option<String>,
     ) -> usize {
         if self.generation.load(Ordering::SeqCst) != gen {
             return 0; // user moved on while we fetched
@@ -3179,6 +3235,15 @@ impl AppState {
         self.freshen_radio(&mut fresh);
         let (added, trimmed) = {
             let mut q = self.queue.lock().await;
+            // The queue changed under the fetch (a splice, a new play, a switch to a different
+            // radio): the rows and the token belong to a queue that no longer exists.
+            if q.radio_seed != original_seed {
+                return 0;
+            }
+            // Advance the token on every successful window, even one that added no rows:
+            // holding the same token would request the same page forever. `None` means the panel
+            // said "ended"; the next top-up falls back to reseed (baseline behavior).
+            q.radio_token = next_token;
             // Against the queue as it is *now*, not a snapshot from before the fetch: a playlist
             // fill, a guest add or `play_song`'s own hydration can all have appended something
             // while we were on the network, and dropping a stale set on top of it duplicates.
@@ -3334,6 +3399,9 @@ impl AppState {
             q.source_name = source_name;
             q.source_id = source_id;
             q.radio = radio;
+            // The token was not persisted — a token belongs to the page we were on. Reset so the
+            // first top-up after a restore reseeds, same as the baseline pre-feature behavior.
+            q.radio_token = None;
         }
         if repeat == RepeatMode::One {
             let _ = self.player.set_loop_file(true);
@@ -3612,6 +3680,7 @@ impl AppState {
             q.lookahead_loaded = None;
             q.shuffle_orig = None; // host rebuilt the queue — local shuffle snapshot is stale
             q.radio_seed = None; // guests never autoplay — the host drives
+            q.radio_token = None; // a guest never tops up; the host's token is not theirs
             q.source_name = None; // the host's context isn't known — header falls back
             q.source_id = None;
             // Once per play, like `seek_to`: a new track gets its own retry, the reload that is
@@ -4442,6 +4511,7 @@ fn splice_radio_into(
     items: Vec<SongItem>,
     seed: String,
     title: Option<String>,
+    token: Option<String>,
 ) {
     let carried = upcoming_queued(&q.items, q.current);
     q.items.truncate(q.current + 1);
@@ -4456,6 +4526,7 @@ fn splice_radio_into(
     q.source_name = title;
     q.source_id = None; // a radio is nobody's playlist to edit
     q.radio = true;
+    q.radio_token = token;
     // Shuffle is sticky across queues: re-snapshot the new order as the "original", then shuffle
     // what's upcoming (same handling as a radio hydration in `play_song`).
     if q.shuffle_orig.is_some() {
@@ -5447,7 +5518,7 @@ mod tests {
             song("mine", None),
             song("old1", None),
         ];
-        splice_radio_into(&mut q, page, "RDAMVMnow".into(), Some("Now Radio".into()));
+        splice_radio_into(&mut q, page, "RDAMVMnow".into(), Some("Now Radio".into()), None);
 
         assert_eq!(ids(&q.items), ["done", "now", "mine", "r1", "old1"]);
         assert_eq!(q.current, 1); // nothing moved under the playing track
@@ -5467,7 +5538,7 @@ mod tests {
             ..QueueState::default()
         };
         let page: Vec<_> = (0..50).map(|i| song(&format!("r{i}"), None)).collect();
-        splice_radio_into(&mut q, page, "RDAMVMnow".into(), None);
+        splice_radio_into(&mut q, page, "RDAMVMnow".into(), None, None);
 
         assert_eq!(q.items[0].video_id, "now"); // the playing track never moves
                                                 // Un-shuffle has the whole radio to restore, not just what was there before it started.
