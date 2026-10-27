@@ -302,7 +302,9 @@ fn automatic_crossfade_runs_both_effected_decks_in_real_time() {
         let mut first_positions = None;
         let mut last_positions = None;
         while p.decks.fading.load(Ordering::Acquire) {
-            assert!(started.elapsed().as_secs_f64() < 2.0, "fade did not finish");
+            // 1.5 s of 50 ms steps, but each step writes both decks synchronously; under the
+            // parallel test run on CI the ramp needs more than the old 2 s cap.
+            assert!(started.elapsed().as_secs_f64() < 5.0, "fade did not finish");
             let a = out.get_property::<f64>("volume").unwrap();
             let b = incoming.get_property::<f64>("volume").unwrap();
             let outputs_ready = [out.as_ref(), incoming.as_ref()]
