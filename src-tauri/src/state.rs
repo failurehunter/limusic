@@ -3090,15 +3090,18 @@ impl AppState {
             if !topup_due(q.items.len(), q.current) {
                 return 0; // tail not near yet
             }
-            let Some(last) = q.items.last() else { return 0 };
+            let last_video = match q.items.last() {
+                Some(i) => i.video_id.clone(),
+                None => return 0, // nothing is playing, nothing to continue from
+            };
             // Nothing to continue from when the queue ends on a local file: its path is not a
             // videoId, and a queue of local music is exactly the case that has to work offline.
-            if q.radio_seed.is_none() && crate::local::is_local_song(&last.video_id) {
+            if q.radio_seed.is_none() && crate::local::is_local_song(&last_video) {
                 return 0;
             }
-            let seed = q.radio_seed.clone().unwrap_or_else(|| format!("RDAMVM{}", last.video_id));
+            let seed = q.radio_seed.clone().unwrap_or_else(|| format!("RDAMVM{}", last_video));
             q.radio_topup = Some(gen);
-            (last.video_id.clone(), seed, q.radio_token.clone(), q.radio)
+            (last_video, seed, q.radio_token.clone(), q.radio)
         };
         let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else {
             self.end_topup(gen).await;
