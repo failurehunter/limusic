@@ -105,6 +105,9 @@ export interface QueueState {
 	 *  Set only while `backToPrevious` would actually do something: at the head of the queue, with
 	 *  a kept one behind it. */
 	prevTrack?: string | null;
+	/** This queue is a YouTube radio: its upcoming tracks are the queue, not autoplay filler, so
+	 *  the autoplay switch has nothing to turn off here. */
+	radio?: boolean;
 }
 
 export interface Account {
@@ -1073,6 +1076,7 @@ export interface QueueIndex {
 	sourceName?: string | null;
 	sourceId?: string | null;
 	prevTrack?: string | null;
+	radio?: boolean;
 	current: SongItem | null;
 }
 

@@ -1553,7 +1553,8 @@ export function initApp(mini = false): () => void {
 				repeat: q.repeat,
 				sourceName: q.sourceName,
 				sourceId: q.sourceId,
-				prevTrack: q.prevTrack
+				prevTrack: q.prevTrack,
+				radio: q.radio
 			};
 		}),
 		api.onQueueAppended((q) => {

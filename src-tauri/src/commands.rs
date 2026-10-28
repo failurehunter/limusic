@@ -1487,7 +1487,15 @@ pub async fn play_playlist(
 ) -> Result<(), String> {
     let state = state.inner().clone();
     state
-        .play_tracks(items, start, source_id, source_name, shuffle.unwrap_or(false), continuation)
+        .play_tracks(
+            items,
+            start,
+            source_id,
+            source_name,
+            shuffle.unwrap_or(false),
+            continuation,
+            None,
+        )
         .await;
     Ok(())
 }

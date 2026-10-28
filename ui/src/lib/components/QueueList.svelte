@@ -324,8 +324,9 @@
 				<p class="truncate text-xs text-muted-foreground tabular-nums">{leftLabel}</p>
 			{/if}
 		</div>
-		{#if canEdit}
-			<!-- Right where its tracks are drawn, rather than three levels into Settings. -->
+		{#if canEdit && !playback.queue.radio}
+			<!-- Right where its tracks are drawn, rather than three levels into Settings. A radio
+			     has no autoplay to switch: its tracks are the queue, not filler behind one. -->
 			<label
 				class="flex shrink-0 cursor-pointer items-center gap-2 text-xs font-medium text-muted-foreground"
 				title={t('settings.playback.autoplay_hint')}
