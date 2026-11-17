@@ -653,18 +653,22 @@ impl InnerTube {
     }
 
     /// Report progress for a play: GET `playbackTracking.videostatsWatchtimeUrl.baseUrl` with the
-    /// position (`st`/`et`/`cmt`/`rt`) and the authed client headers. context/01 §registerPlayback.
+    /// reported span (`st`/`et`) and the authed client headers. context/01 §registerPlayback.
     ///
-    /// YouTube's own player sends this alongside [`Self::register_playback`]. Best-effort — the
-    /// caller logs-and-ignores errors.
+    /// YouTube's own player sends this periodically while a track plays and once more when it
+    /// pauses, with `state` = `playing`/`paused`; `is_final` adds the `final=1` it sends when the
+    /// play is disposed of. Best-effort — the caller logs-and-ignores errors.
     pub async fn register_watchtime(
         &self,
         client: &YouTubeClient,
         base_url: &str,
         cpn: &str,
-        position_secs: f64,
+        st: f64,
+        et: f64,
+        state: &str,
+        is_final: bool,
     ) -> Result<(), Error> {
-        let url = build_watchtime_url(base_url, &client.client_name, cpn, position_secs);
+        let url = build_watchtime_url(base_url, &client.client_name, cpn, st, et, state, is_final);
         let headers = self.headers(client, true);
         let resp = self.http.get(&url).headers(headers).send().await?.error_for_status()?;
         self.absorb_cookies(resp.headers());
@@ -764,16 +768,33 @@ fn build_playback_url(
 ///
 /// `base_url` already carries YouTube's own params (`docid`/`ei`/`len`/...), so we chain onto it.
 /// `st`/`et` bound the reported span; `cmt` is the media clock and `rt` the wall clock, which for
-/// a single tick of one play are the same number.
-fn build_watchtime_url(base_url: &str, client_name: &str, cpn: &str, position_secs: f64) -> String {
+/// one report of one play are the same number.
+fn build_watchtime_url(
+    base_url: &str,
+    client_name: &str,
+    cpn: &str,
+    st: f64,
+    et: f64,
+    state: &str,
+    is_final: bool,
+) -> String {
     let sep = if base_url.contains('?') { '&' } else { '?' };
     // NaN would print as "NaN" and YouTube would drop the whole report; clamp it to zero.
-    let at = format!("{:.3}", position_secs.max(0.0));
-    format!(
-        "{base_url}{sep}c={}&cpn={}&ver=2&st=0&et={at}&cmt={at}&rt={at}&state=playing",
+    let (st, et) = (secs(st), secs(et));
+    let mut url = format!(
+        "{base_url}{sep}c={}&cpn={}&ver=2&st={st}&et={et}&cmt={et}&rt={et}&state={state}",
         urlencoding::encode(client_name),
         urlencoding::encode(cpn),
-    )
+    );
+    if is_final {
+        url.push_str("&final=1");
+    }
+    url
+}
+
+/// Seconds for a watchtime param: three decimals, never negative, never NaN.
+fn secs(v: f64) -> String {
+    format!("{:.3}", v.max(0.0))
 }
 
 /// CPN alphabet — 64 URL-safe chars, exactly 6 bits each. context/01.
@@ -888,20 +909,46 @@ mod tests {
             "https://s.youtube.com/api/stats/watchtime?cl=1&docid=abc&len=80",
             "WEB_REMIX",
             "CPN1234567890AB",
+            5.0,
             12.5,
+            "playing",
+            false,
         );
         assert!(u.starts_with("https://s.youtube.com/api/stats/watchtime?cl=1&docid=abc&len=80&"));
         assert!(u.contains("&c=WEB_REMIX&cpn=CPN1234567890AB&ver=2"));
-        assert!(u.contains("&st=0&et=12.500&cmt=12.500&rt=12.500&state=playing"));
+        assert!(u.contains("&st=5.000&et=12.500&cmt=12.500&rt=12.500&state=playing"));
+        assert!(!u.contains("final"));
+    }
+
+    #[test]
+    fn watchtime_url_marks_the_final_report() {
+        let u = build_watchtime_url(
+            "https://s.youtube.com/api/stats/watchtime",
+            "WEB",
+            "c",
+            0.0,
+            30.0,
+            "paused",
+            true,
+        );
+        assert!(u.ends_with("&state=paused&final=1"));
     }
 
     #[test]
     fn watchtime_url_never_writes_nan() {
         // A NaN position would print as "NaN" and YouTube would drop the whole report.
-        let u = build_watchtime_url("https://s.youtube.com/api/stats/watchtime", "WEB", "c", f64::NAN);
+        let u = build_watchtime_url(
+            "https://s.youtube.com/api/stats/watchtime",
+            "WEB",
+            "c",
+            f64::NAN,
+            f64::NAN,
+            "playing",
+            false,
+        );
         assert_eq!(
             u,
-            "https://s.youtube.com/api/stats/watchtime?c=WEB&cpn=c&ver=2&st=0&et=0.000&cmt=0.000&rt=0.000&state=playing"
+            "https://s.youtube.com/api/stats/watchtime?c=WEB&cpn=c&ver=2&st=0.000&et=0.000&cmt=0.000&rt=0.000&state=playing"
         );
     }
 

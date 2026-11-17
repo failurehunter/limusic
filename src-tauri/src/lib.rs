@@ -1694,6 +1694,9 @@ fn spawn_event_pump(
                     }
                     if !playing {
                         state.flush_position(); // persist exact resume position on pause
+                        // The last progress report for this play, as the official player sends it
+                        // when playback pauses. Best-effort.
+                        state.watchtime_report(state.current_position(), "paused", false).await;
                         if !remote {
                             let _ = app.emit(
                                 "position",
