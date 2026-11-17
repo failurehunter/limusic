@@ -108,6 +108,11 @@ pub struct AppState {
     /// stalled the event pump behind `emit_queue`, `persist_queue`, `prime_lookahead` and the
     /// Listen Together broadcasts for nothing.
     history_pinged: AtomicBool,
+    /// When the last watchtime report went out (epoch secs), and where it ended (`et` as f64
+    /// bits). The next report covers `watchtime_pos..pos`, like the official player's segments.
+    /// See [`Self::watchtime_report`].
+    watchtime_at: AtomicU64,
+    watchtime_pos: AtomicU64,
     /// The play being heard right now, for the listening stats (#396). See [`Self::hear`].
     listen: std::sync::Mutex<Listen>,
     /// Mirror of mpv's pause flag (set in `media_set_playing`). Position ticks must consult this
@@ -562,6 +567,8 @@ impl AppState {
             auth: tokio::sync::Mutex::default(),
             reload_mutex: tokio::sync::Mutex::default(),
             history_pinged: AtomicBool::new(false),
+            watchtime_at: AtomicU64::new(0),
+            watchtime_pos: AtomicU64::new(0),
             listen: std::sync::Mutex::default(),
             is_playing: AtomicBool::new(false),
             auto_pause_enabled: AtomicBool::new(false),
@@ -2143,7 +2150,7 @@ impl AppState {
             // New track is now playing → fresh history state (mirrors start_current).
             q.playback_ping = q.lookahead_playback_ping.take();
             q.cpn = innertube::generate_cpn();
-            self.history_pinged.store(false, Ordering::Relaxed);
+            self.reset_watchtime();
             self.end_listen();
             q.duration = 0.0;
             q.live = false;
@@ -2452,7 +2459,7 @@ impl AppState {
             // Fresh play → fresh history state (context/01 §registerPlayback).
             q.playback_ping = data.playback_ping.clone();
             q.cpn = innertube::generate_cpn();
-            self.history_pinged.store(false, Ordering::Relaxed);
+            self.reset_watchtime();
             self.end_listen();
             q.duration = 0.0;
             // Across a restart too: the restored track is announced before anything resolves it,
@@ -3997,6 +4004,18 @@ impl AppState {
                 }
             }
         }
+        // Periodic watchtime, mirroring the official player's scheduled flush: one report every
+        // `WATCHTIME_INTERVAL` seconds of playback, and one more as soon as it pauses. The
+        // playback ping below only reaches history; these reports are what recommendations read.
+        let playing = self.is_playing.load(Ordering::Relaxed);
+        let last_et = f64::from_bits(self.watchtime_pos.load(Ordering::Relaxed));
+        let since = (now_secs() as u64).saturating_sub(self.watchtime_at.load(Ordering::Relaxed));
+        let due =
+            since >= WATCHTIME_INTERVAL || (!playing && pos > last_et + 0.5);
+        if due {
+            self.watchtime_report(pos, if playing { "playing" } else { "paused" }, false)
+                .await;
+        }
         // Latched: nothing below can fire again for this play, so don't queue up behind the
         // queue mutex on every tick just to be told so. See `AppState::history_pinged`.
         if self.history_pinged.load(Ordering::Relaxed) {
@@ -4010,12 +4029,12 @@ impl AppState {
             if pos >= history_threshold(q.duration)
                 && !self.history_pinged.swap(true, Ordering::Relaxed)
             {
-                Some((q.playback_ping.clone(), q.cpn.clone(), q.items.get(q.current).cloned(), pos))
+                Some((q.playback_ping.clone(), q.cpn.clone(), q.items.get(q.current).cloned()))
             } else {
                 None
             }
         };
-        let Some((ping, cpn, played, pos)) = crossed else { return };
+        let Some((ping, cpn, played)) = crossed else { return };
 
         // Local play count (On Repeat, the stats page), on the same threshold. Deliberately not
         // gated on `enable_history` or sign-in: that setting is about registering plays with
@@ -4057,14 +4076,6 @@ impl AppState {
                 Ok(()) => tracing::debug!(client = %ping.client, "watch-history ping sent"),
                 Err(e) => tracing::warn!(error = %e, "watch-history ping failed"),
             }
-            // The progress report YouTube's own player sends next. Without it a play can reach
-            // history while never feeding recommendations. Best-effort, like the ping above.
-            if let Some(watchtime) = ping.watchtime_url.as_deref() {
-                match it.register_watchtime(&client, watchtime, &cpn, pos).await {
-                    Ok(()) => tracing::debug!(client = %ping.client, "watchtime ping sent"),
-                    Err(e) => tracing::warn!(error = %e, "watchtime ping failed"),
-                }
-            }
         });
     }
 
@@ -4086,6 +4097,53 @@ impl AppState {
     /// Watch-history ping enabled? Default on; only an explicit `"false"` disables it.
     fn history_enabled(&self) -> bool {
         self.db.get_setting("enable_history").map(|v| v != "false").unwrap_or(true)
+    }
+
+    /// A new play starts: the playback ping and the watchtime reports both fire again.
+    fn reset_watchtime(&self) {
+        self.history_pinged.store(false, Ordering::Relaxed);
+        self.watchtime_at.store(0, Ordering::Relaxed);
+        self.watchtime_pos.store(0, Ordering::Relaxed);
+    }
+
+    /// Send one watchtime report for the play that is loaded, covering `watchtime_pos..pos`.
+    ///
+    /// `state` is `"playing"` or `"paused"`, `is_final` the `final=1` YouTube's player adds when
+    /// it disposes of a play. Best-effort and detached: it must never stall the event pump.
+    pub async fn watchtime_report(&self, pos: f64, state: &str, is_final: bool) {
+        if !self.history_enabled() || !self.it.is_logged_in() {
+            return;
+        }
+        let (ping, cpn, st) = {
+            let q = self.queue.lock().await;
+            let st = f64::from_bits(self.watchtime_pos.load(Ordering::Relaxed));
+            match (&q.playback_ping, &q.cpn) {
+                (Some(ping), cpn) => (ping.clone(), cpn.clone(), st),
+                _ => return,
+            }
+        };
+        // No watchtime URL in the /player response (or a cache row from before the column):
+        // nothing to report, and the playback ping is all YouTube gets.
+        let Some(watchtime) = ping.watchtime_url.clone() else { return };
+        // The client the URL was issued to, not always the metadata one.
+        let Some(client) = self.clients.get(&ping.client).cloned() else { return };
+
+        let et = pos.max(st);
+        // A pause in the first instants, or two pauses in a row: the last report already said it.
+        if et <= st && !is_final {
+            return;
+        }
+        self.watchtime_pos.store(et.to_bits(), Ordering::Relaxed);
+        self.watchtime_at.store(now_secs() as u64, Ordering::Relaxed);
+
+        let it = self.it.clone();
+        let state = state.to_owned();
+        tauri::async_runtime::spawn(async move {
+            match it.register_watchtime(&client, &watchtime, &cpn, st, et, &state, is_final).await {
+                Ok(()) => tracing::debug!(client = %ping.client, state = %state, "watchtime ping sent"),
+                Err(e) => tracing::warn!(error = %e, state = %state, "watchtime ping failed"),
+            }
+        });
     }
 
     /// Shuffle sticky across queues? Default off: turning shuffle on applies to the queue that's
@@ -4472,7 +4530,7 @@ impl AppState {
         let duration = {
             let mut q = self.queue.lock().await;
             q.cpn = innertube::generate_cpn();
-            self.history_pinged.store(false, Ordering::Relaxed);
+            self.reset_watchtime();
             self.end_listen();
             q.duration
         };
@@ -4699,7 +4757,7 @@ impl AppState {
             // track plays on through the resolve and that time is still its own.
             q.playback_ping = data.playback_ping.clone();
             q.cpn = innertube::generate_cpn();
-            self.history_pinged.store(false, Ordering::Relaxed);
+            self.reset_watchtime();
             self.end_listen();
             q.duration = 0.0;
             q.live = data.live;
@@ -6551,6 +6609,12 @@ fn history_threshold(duration: f64) -> f64 {
         30.0
     }
 }
+
+/// How often the watchtime report goes out while a track plays. YouTube's own player uses the
+/// response's `videostatsScheduledFlushWalltimeSeconds` ([10, 20, 30] on a real /player reply);
+/// a flat 10s is the same first interval and needs no plumbing.
+// shortcut: ignores videostatsScheduledFlushWalltimeSeconds; read it off /player if the cadence ever matters.
+const WATCHTIME_INTERVAL: u64 = 10;
 
 /// Per-track loudness gain (dB) from YouTube's `loudnessDb` (context/03, context/14), toward the
 /// -7 LUFS target: loud masters get pulled down, quiet ones get lifted (#237). The player adds a
