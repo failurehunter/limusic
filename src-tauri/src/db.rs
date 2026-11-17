@@ -86,6 +86,9 @@ pub struct CachedStream {
     /// lookahead caches the next track and a non-gapless advance then re-resolves it. Issue #83.
     pub ping_url: Option<String>,
     pub ping_client: Option<String>,
+    /// The matching `videostatsWatchtimeUrl` for the same play, cached for the same reason. `None`
+    /// on rows written before the column; that replay just goes unregistered for progress.
+    pub watchtime_url: Option<String>,
     /// The client whose URL this is ("WEB_REMIX", "VISIONOS", ...), so a replay can rebuild the
     /// headers the URL was validated under (the User-Agent is per client; the wrong one is a 403)
     /// and a failure toast can name it. `ping_client` is not a substitute: the orchestrator prefers
@@ -177,7 +180,8 @@ impl Db {
                 loudness_db REAL,
                 is_video    INTEGER,
                 ping_url    TEXT,
-                ping_client TEXT
+                ping_client TEXT,
+                watchtime_url TEXT
             );
             CREATE TABLE IF NOT EXISTS lyrics_cache (
                 video_id   TEXT PRIMARY KEY,
@@ -292,6 +296,9 @@ impl Db {
         // means that one replay goes unregistered, which is exactly what every row did before.
         let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN ping_url TEXT", []);
         let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN ping_client TEXT", []);
+        // The matching watchtime URL. No wipe: a NULL just means that one cached replay sends no
+        // progress report, which is exactly what every row did before.
+        let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN watchtime_url TEXT", []);
         // The resolving client, so a replay can rebuild its headers and name itself. Rows that
         // predate it have neither, which is the bug, so wipe them once like `is_video` above.
         if conn.execute("ALTER TABLE stream_url_cache ADD COLUMN client TEXT", []).is_ok() {
@@ -711,7 +718,7 @@ impl Db {
     pub fn get_stream(&self, video_id: &str, now: i64) -> Option<CachedStream> {
         let conn = self.0.lock().unwrap();
         conn.query_row(
-            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, is_episode FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
+            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, watchtime_url, client, is_episode FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
             rusqlite::params![video_id, now],
             |r| {
                 Ok(CachedStream {
@@ -722,8 +729,9 @@ impl Db {
                     is_video: r.get(4)?,
                     ping_url: r.get(5)?,
                     ping_client: r.get(6)?,
-                    client: r.get(7)?,
-                    is_episode: r.get(8)?,
+                    watchtime_url: r.get(7)?,
+                    client: r.get(8)?,
+                    is_episode: r.get(9)?,
                 })
             },
         )
@@ -745,8 +753,8 @@ impl Db {
     pub fn put_stream(&self, video_id: &str, row: &CachedStream, now: i64) {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, is_episode) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, client = excluded.client, is_episode = excluded.is_episode",
+            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, watchtime_url, client, is_episode) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, watchtime_url = excluded.watchtime_url, client = excluded.client, is_episode = excluded.is_episode",
             rusqlite::params![
                 video_id,
                 row.url,
@@ -756,6 +764,7 @@ impl Db {
                 row.is_video,
                 row.ping_url,
                 row.ping_client,
+                row.watchtime_url,
                 row.client,
                 row.is_episode
             ],
@@ -1824,6 +1833,7 @@ mod tests {
             is_episode: None,
             ping_url: None,
             ping_client: None,
+            watchtime_url: None,
             client: None,
         }
     }
@@ -2499,6 +2509,7 @@ mod tests {
             is_episode: Some(true),
             ping_url: Some("https://s.youtube.com/api/stats/playback".into()),
             ping_client: Some("WEB_REMIX".into()),
+            watchtime_url: Some("https://s.youtube.com/api/stats/watchtime".into()),
             client: Some("VISIONOS".into()),
         };
         d.put_stream("fresh", &fresh, now);

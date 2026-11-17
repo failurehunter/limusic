@@ -601,6 +601,11 @@ mod tests {
 pub struct PlaybackTracking {
     #[serde(default)]
     pub videostats_playback_url: Option<BaseUrl>,
+    /// Where YouTube expects the progress report for the same play (`state`/`st`/`et`). The
+    /// official player sends it next to `videostatsPlaybackUrl`; without it a play can reach
+    /// history while never feeding recommendations. See [`crate::InnerTube::register_watchtime`].
+    #[serde(default)]
+    pub videostats_watchtime_url: Option<BaseUrl>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

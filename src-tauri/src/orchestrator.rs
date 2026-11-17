@@ -64,6 +64,10 @@ pub struct PlaybackData {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PlaybackPing {
     pub url: String,
+    /// `playbackTracking.videostatsWatchtimeUrl.baseUrl`: where the progress report for the same
+    /// play goes. `None` when the response carried none, and on cache rows written before it.
+    #[serde(default)]
+    pub watchtime_url: Option<String>,
     pub client: String,
 }
 
@@ -1009,12 +1013,11 @@ fn main_loudness(resp: &PlayerResponse) -> Option<f64> {
 }
 
 fn playback_ping(resp: &PlayerResponse, client: &str) -> Option<PlaybackPing> {
-    let url = resp
-        .playback_tracking
-        .as_ref()
-        .and_then(|t| t.videostats_playback_url.as_ref())
-        .and_then(|b| b.base_url.clone())?;
-    Some(PlaybackPing { url, client: client.to_owned() })
+    let tracking = resp.playback_tracking.as_ref()?;
+    let url = tracking.videostats_playback_url.as_ref()?.base_url.clone()?;
+    let watchtime_url =
+        tracking.videostats_watchtime_url.as_ref().and_then(|b| b.base_url.clone());
+    Some(PlaybackPing { url, watchtime_url, client: client.to_owned() })
 }
 
 fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {

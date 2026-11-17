@@ -652,6 +652,25 @@ impl InnerTube {
         Ok(())
     }
 
+    /// Report progress for a play: GET `playbackTracking.videostatsWatchtimeUrl.baseUrl` with the
+    /// position (`st`/`et`/`cmt`/`rt`) and the authed client headers. context/01 §registerPlayback.
+    ///
+    /// YouTube's own player sends this alongside [`Self::register_playback`]. Best-effort — the
+    /// caller logs-and-ignores errors.
+    pub async fn register_watchtime(
+        &self,
+        client: &YouTubeClient,
+        base_url: &str,
+        cpn: &str,
+        position_secs: f64,
+    ) -> Result<(), Error> {
+        let url = build_watchtime_url(base_url, &client.client_name, cpn, position_secs);
+        let headers = self.headers(client, true);
+        let resp = self.http.get(&url).headers(headers).send().await?.error_for_status()?;
+        self.absorb_cookies(resp.headers());
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "integration-tests"))]
     pub fn http(&self) -> &reqwest::Client {
         &self.http
@@ -739,6 +758,22 @@ fn build_playback_url(
         url.push_str(&format!("&list={enc}&referrer={enc}"));
     }
     url
+}
+
+/// Build the watchtime-tracking GET URL. context/01 §registerPlayback. Pure — unit-tested.
+///
+/// `base_url` already carries YouTube's own params (`docid`/`ei`/`len`/...), so we chain onto it.
+/// `st`/`et` bound the reported span; `cmt` is the media clock and `rt` the wall clock, which for
+/// a single tick of one play are the same number.
+fn build_watchtime_url(base_url: &str, client_name: &str, cpn: &str, position_secs: f64) -> String {
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    // NaN would print as "NaN" and YouTube would drop the whole report; clamp it to zero.
+    let at = format!("{:.3}", position_secs.max(0.0));
+    format!(
+        "{base_url}{sep}c={}&cpn={}&ver=2&st=0&et={at}&cmt={at}&rt={at}&state=playing",
+        urlencoding::encode(client_name),
+        urlencoding::encode(cpn),
+    )
 }
 
 /// CPN alphabet — 64 URL-safe chars, exactly 6 bits each. context/01.
@@ -844,6 +879,30 @@ mod tests {
         // No existing query → first param uses `?`, no playlist params.
         let u2 = build_playback_url("https://s.youtube.com/x", "IOS", "abc", None);
         assert_eq!(u2, "https://s.youtube.com/x?c=IOS&cpn=abc&ver=2");
+    }
+
+    #[test]
+    fn watchtime_url_carries_progress() {
+        // Base URL already has YouTube's own params (`docid`/`len`) → chained with `&`.
+        let u = build_watchtime_url(
+            "https://s.youtube.com/api/stats/watchtime?cl=1&docid=abc&len=80",
+            "WEB_REMIX",
+            "CPN1234567890AB",
+            12.5,
+        );
+        assert!(u.starts_with("https://s.youtube.com/api/stats/watchtime?cl=1&docid=abc&len=80&"));
+        assert!(u.contains("&c=WEB_REMIX&cpn=CPN1234567890AB&ver=2"));
+        assert!(u.contains("&st=0&et=12.500&cmt=12.500&rt=12.500&state=playing"));
+    }
+
+    #[test]
+    fn watchtime_url_never_writes_nan() {
+        // A NaN position would print as "NaN" and YouTube would drop the whole report.
+        let u = build_watchtime_url("https://s.youtube.com/api/stats/watchtime", "WEB", "c", f64::NAN);
+        assert_eq!(
+            u,
+            "https://s.youtube.com/api/stats/watchtime?c=WEB&cpn=c&ver=2&st=0&et=0.000&cmt=0.000&rt=0.000&state=playing"
+        );
     }
 
     #[test]

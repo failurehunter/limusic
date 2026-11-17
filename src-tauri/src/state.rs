@@ -1315,10 +1315,11 @@ impl AppState {
                 // gapless lookahead had already cached (issue #83). `None` on rows written before
                 // the column, and on whatever YouTube declines a stale `ei` for; the ping is
                 // best-effort either way.
-                playback_ping: c
-                    .ping_url
-                    .zip(c.ping_client)
-                    .map(|(url, client)| PlaybackPing { url, client }),
+                playback_ping: c.ping_url.zip(c.ping_client).map(|(url, client)| PlaybackPing {
+                    url,
+                    watchtime_url: c.watchtime_url,
+                    client,
+                }),
                 title: None,
                 artists: None,
                 duration: None,
@@ -1356,6 +1357,10 @@ impl AppState {
                     is_episode: data.is_episode,
                     ping_url: data.playback_ping.as_ref().map(|p| p.url.clone()),
                     ping_client: data.playback_ping.as_ref().map(|p| p.client.clone()),
+                    watchtime_url: data
+                        .playback_ping
+                        .as_ref()
+                        .and_then(|p| p.watchtime_url.clone()),
                     client: Some(data.stream_client.clone()),
                 },
                 now,
@@ -4005,12 +4010,12 @@ impl AppState {
             if pos >= history_threshold(q.duration)
                 && !self.history_pinged.swap(true, Ordering::Relaxed)
             {
-                Some((q.playback_ping.clone(), q.cpn.clone(), q.items.get(q.current).cloned()))
+                Some((q.playback_ping.clone(), q.cpn.clone(), q.items.get(q.current).cloned(), pos))
             } else {
                 None
             }
         };
-        let Some((ping, cpn, played)) = crossed else { return };
+        let Some((ping, cpn, played, pos)) = crossed else { return };
 
         // Local play count (On Repeat, the stats page), on the same threshold. Deliberately not
         // gated on `enable_history` or sign-in: that setting is about registering plays with
@@ -4051,6 +4056,14 @@ impl AppState {
             match it.register_playback(&client, &ping.url, &cpn, None).await {
                 Ok(()) => tracing::debug!(client = %ping.client, "watch-history ping sent"),
                 Err(e) => tracing::warn!(error = %e, "watch-history ping failed"),
+            }
+            // The progress report YouTube's own player sends next. Without it a play can reach
+            // history while never feeding recommendations. Best-effort, like the ping above.
+            if let Some(watchtime) = ping.watchtime_url.as_deref() {
+                match it.register_watchtime(&client, watchtime, &cpn, pos).await {
+                    Ok(()) => tracing::debug!(client = %ping.client, "watchtime ping sent"),
+                    Err(e) => tracing::warn!(error = %e, "watchtime ping failed"),
+                }
             }
         });
     }
