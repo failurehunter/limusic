@@ -118,6 +118,10 @@ pub struct CipherDeobfuscator {
     fetcher: PlayerJsFetcher,
     config: Arc<PlayerConfigStore>,
     inner: Mutex<Inner>,
+    /// One analysis/build at a time. `inner` only guards the check, so two callers that both saw
+    /// a stale epoch used to fetch player.js and build a webview in parallel (two 3 MB downloads
+    /// and two `WebKitWebProcess`es for one rebuild). Held across the fetch and the build.
+    build: tokio::sync::Mutex<()>,
 }
 
 impl CipherDeobfuscator {
@@ -126,6 +130,7 @@ impl CipherDeobfuscator {
             fetcher: PlayerJsFetcher::new(app_data_dir),
             config,
             inner: Mutex::new(Inner::default()),
+            build: tokio::sync::Mutex::new(()),
             app,
         }
     }
@@ -291,6 +296,13 @@ impl CipherDeobfuscator {
     /// the analysis alone satisfies `signature_timestamp`. Callers that only need STS pass `false`
     /// and never pay for a web process (see [`Self::prewarm`]).
     async fn ensure_analyzed(&self, want_bridge: bool) -> Result<(), String> {
+        // Serialise the whole check-fetch-build: the epoch is re-read after the lock, so a second
+        // caller that was waiting sees the first one's work and returns instead of repeating it.
+        // The cost is that an STS-only caller (`signature_timestamp`, `prewarm`) now waits for a
+        // webview build in progress instead of reading the old STS and moving on; that is the price
+        // of not letting two callers build at once. The build is ~1.3 s warm, and a cold one is
+        // the case that used to produce two.
+        let _build = self.build.lock().await;
         let epoch = self.config.config_epoch();
         {
             let inner = self.inner.lock().await;
