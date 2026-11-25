@@ -514,7 +514,10 @@ impl Orchestrator {
             // is not a prediction of anything. Issue #71.
             let headers =
                 stream_headers(client.map(|c| c.user_agent.clone()), self.it.cookie(), is_upload);
-            if self.validate_stream(&url, &headers, content_length(format)).await {
+            if self
+                .validate_stream(video_id, &key, &url, &headers, content_length(format))
+                .await
+            {
                 let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
                 return Ok(self.build(
                     video_id,
@@ -630,7 +633,10 @@ impl Orchestrator {
         }
         tracing::info!(video_id, "all InnerTube clients exhausted → rustypipe fallback");
         match rustypipe_fallback::resolve(video_id, prefer_high).await {
-            Ok(c) if !self.validate_stream(&c.url, &HashMap::new(), Some(c.size)).await => {
+            Ok(c) if !self
+                .validate_stream(video_id, "rustypipe", &c.url, &HashMap::new(), Some(c.size))
+                .await =>
+            {
                 tracing::warn!(video_id, "rustypipe URL serves only its first MiB, not playable");
                 // rustypipe answered, so the network is up and this failure is about the URL.
                 Err(nothing_played(video_id, logged_in, login_wanted, true))
@@ -779,7 +785,16 @@ impl Orchestrator {
         let format = find_video_format(&sd, max_height)?;
         let url = self.find_url(format, video_id).await?;
         let url = self.sign(url, Some(client), video_id, visitor.as_deref()).await;
-        if !self.validate_stream(&url, &HashMap::new(), content_length(format)).await {
+        if !self
+            .validate_stream(
+                video_id,
+                &client.client_name,
+                &url,
+                &HashMap::new(),
+                content_length(format),
+            )
+            .await
+        {
             tracing::debug!(video_id, itag = format.itag, "video: WEB_REMIX URL refused");
             return None;
         }
@@ -863,6 +878,8 @@ impl Orchestrator {
     /// ranges at all (#294). Success = 2xx, false on any error.
     async fn validate_stream(
         &self,
+        video_id: &str,
+        client: &str,
         url: &str,
         headers: &HashMap<String, String>,
         content_length: Option<u64>,
@@ -879,7 +896,19 @@ impl Orchestrator {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        matches!(req.send().await, Ok(r) if r.status().is_success())
+        // A refusal here is invisible to the caller (it just `continue`s), which is why a dead
+        // stream URL used to look like "nothing loaded" with no line to explain it. context/06.
+        match req.send().await {
+            Ok(r) if r.status().is_success() => true,
+            Ok(r) => {
+                tracing::warn!(video_id, client, status = %r.status(), "stream validation refused");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(video_id, client, error = %e, "stream validation failed");
+                false
+            }
+        }
     }
 
     /// A live playlist is text with no length, so the ranged probe above has nothing to ask for:
