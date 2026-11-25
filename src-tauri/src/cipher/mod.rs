@@ -220,11 +220,15 @@ impl CipherDeobfuscator {
         }
     }
 
-    /// Self-heal after a 403 on a deciphered URL: refresh the config table + invalidate player.js.
+    /// Self-heal after a 403 on a deciphered URL: refresh the config table and re-analyse.
     /// Returns true if something changed (caller may clear WEB_REMIX failure memory). context/05, 06.
+    ///
+    /// `player.js` is deliberately **not** invalidated here. `fetch()` always re-reads the hash
+    /// from `iframe_api` and keys the cache on it, so a rotation misses the cache on its own; the
+    /// 3 MB download only happens when the hash actually changed. Dropping the file
+    /// unconditionally made every accepted self-heal re-download it for nothing.
     pub async fn on_stream_rejected(&self) -> bool {
         let table_changed = self.config.refresh_rate_limited().await;
-        self.fetcher.invalidate();
         {
             let mut inner = self.inner.lock().await;
             inner.analyzed = false; // next ensure_analyzed rebuilds
