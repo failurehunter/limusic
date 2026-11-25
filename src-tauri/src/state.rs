@@ -2331,6 +2331,8 @@ impl AppState {
         // Resolve the current track, auto-skipping any that no client can play (dead / region-locked
         // videos — context/06 "no client could resolve") instead of stalling the queue on them.
         // Bounded: each failure advances current by one, so the loop terminates at the queue tail.
+        // A 5xx sweep skips the same way, but only a couple of times in a row.
+        let mut transient_skips = 0u8;
         let (mut item, data) = loop {
             if self.generation.load(Ordering::SeqCst) != gen {
                 return false; // user moved on
@@ -2383,14 +2385,27 @@ impl AppState {
                     }
                 }
                 Err(e) if e.affects_every_track() => {
-                    // Nothing is wrong with this track: the network is down, or YouTube is
-                    // refusing every anonymous client right now. Skipping would walk the whole
-                    // queue in a couple of seconds, toast once per track and persist the new
-                    // position, so stay exactly where we are and say what happened.
+                    // Nothing is wrong with this track: the network is down, or YouTube needs an
+                    // account. Skipping would walk the whole queue, so stay exactly where we are
+                    // and say what happened.
                     self.emit_error(&item.video_id, &e.to_string());
                     return false;
                 }
                 Err(e) => {
+                    // A 5xx sweep is YouTube refusing for now, not a verdict on the track. Skip it
+                    // like any other failure — the row stays in `items` — but only a couple of
+                    // times in a row: a global outage would otherwise walk the whole queue, and
+                    // each 5xx costs a full sweep (20-40 s), not the instant refusal an
+                    // `Unreachable` gives.
+                    if matches!(&e, ResolveError::Transient(_)) {
+                        transient_skips += 1;
+                        if transient_skips > TRANSIENT_SKIPS {
+                            self.emit_error(&item.video_id, &e.to_string());
+                            return false;
+                        }
+                    } else {
+                        transient_skips = 0;
+                    }
                     let mut q = self.queue.lock().await;
                     // Deliberately ignores repeat-all: wrapping the unplayable-skip would spin
                     // forever on a queue where nothing resolves. Skips stop at the tail.
@@ -2583,7 +2598,7 @@ impl AppState {
                     return;
                 }
                 Err(e) => {
-                    if e.affects_every_track() {
+                    if e.keeps_row() {
                         // The next track is fine; we just cannot reach YouTube. Removing it here
                         // would delete a good row from the persisted queue, and the retry loop
                         // would do it again to the row that moved up. Leave the queue alone and
@@ -6214,11 +6229,13 @@ fn merge_radio(
 /// What the skip toast blames. "unavailable" is right for a video YouTube would not serve, and
 /// wrong for an upload: the file is still there, the session is what failed. Issue #71.
 ///
-/// `Unreachable` and `SignInRequired` no longer reach here: `ResolveError::affects_every_track`
-/// stops both call sites before they skip anything, because neither says anything about the track.
+/// `Unreachable` and `SignInRequired` never reach here: `start_current` stops on them and the
+/// lookahead leaves the queue alone. A `Transient` does reach here on every allowed skip (the
+/// limit returns before the toast), so it says the row is still queued rather than "unavailable".
 fn skip_reason(e: &ResolveError) -> &'static str {
     match e {
         ResolveError::UploadUnavailable(_) | ResolveError::SignInRequired(_) => "sign-in needed",
+        ResolveError::Transient(_) => "YouTube refused for now, the track stays in the queue",
         _ => "unavailable",
     }
 }
@@ -6649,6 +6666,11 @@ fn history_threshold(duration: f64) -> f64 {
         30.0
     }
 }
+
+/// How many tracks in a row a 5xx sweep may skip before `start_current` stops. Each skip costs a
+/// full sweep (20-40 s), so this bounds a global outage to a couple of minutes; the row is kept
+/// either way, so a later play can come back to it.
+const TRANSIENT_SKIPS: u8 = 2;
 
 /// Per-track loudness gain (dB) from YouTube's `loudnessDb` (context/03, context/14), toward the
 /// -7 LUFS target: loud masters get pulled down, quiet ones get lifted (#237). The player adds a

@@ -73,6 +73,12 @@ pub struct PlaybackPing {
 pub enum ResolveError {
     #[error("no client could resolve a playable stream for {0}")]
     AllClientsFailed(String),
+    /// Every InnerTube client's probe failed with a 5xx (or the probe never answered). The track
+    /// is not at fault and YouTube is refusing for now, so the queue must keep the row and retry
+    /// rather than delete it. Distinct from [`ResolveError::Unreachable`], which is "nothing
+    /// answered at all".
+    #[error("YouTube is refusing streams right now, try again in a moment ({0})")]
+    Transient(String),
     /// One of the user's own uploads that no authenticated client would stream. Distinct from
     /// `AllClientsFailed` because "unavailable" reads as "the song is gone", and the likely cause
     /// here is a session that needs signing in again. Issue #71.
@@ -100,6 +106,13 @@ impl ResolveError {
     /// wrong for an outage, where it walks the whole queue and deletes what it passes.
     pub fn affects_every_track(&self) -> bool {
         matches!(self, ResolveError::Unreachable(_) | ResolveError::SignInRequired(_))
+    }
+
+    /// Would skipping this row lose it for good? The lookahead uses this instead of
+    /// [`Self::affects_every_track`]: a 5xx is not a verdict on the track, so the row must stay in
+    /// the queue even though `start_current` may skip past it.
+    pub fn keeps_row(&self) -> bool {
+        self.affects_every_track() || matches!(self, ResolveError::Transient(_))
     }
 }
 
@@ -332,6 +345,10 @@ impl Orchestrator {
         // Did YouTube answer anything at all? A refusal is information about the track; silence is
         // information about the network, and the two want opposite handling upstream.
         let mut reached = main_resp.is_some();
+        // A 5xx (or a probe that never answered) is YouTube refusing for now, not a verdict on the
+        // track; a 4xx is a verdict. Both are tracked so the final error can tell them apart.
+        let mut transient = false;
+        let mut hard = false;
         // A login client's upload URL that failed HEAD. Used only if nothing validates.
         let mut upload_fallback: Option<Candidate> = None;
         let last_idx = order.len() as isize - 1;
@@ -514,10 +531,10 @@ impl Orchestrator {
             // is not a prediction of anything. Issue #71.
             let headers =
                 stream_headers(client.map(|c| c.user_agent.clone()), self.it.cookie(), is_upload);
-            if self
+            let probe = self
                 .validate_stream(video_id, &key, &url, &headers, content_length(format))
-                .await
-            {
+                .await;
+            if probe.is_ok() {
                 let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
                 return Ok(self.build(
                     video_id,
@@ -530,6 +547,14 @@ impl Orchestrator {
                     ping,
                     headers,
                 ));
+            }
+            // 0 (no answer) and 5xx are "YouTube refuses for now"; a 4xx is a verdict on the track.
+            if let Err(status) = &probe {
+                if is_transient(*status) {
+                    transient = true;
+                } else {
+                    hard = true;
+                }
             }
 
             // An upload's failed probe is a demotion, never a rejection. Metrolist stopped
@@ -553,7 +578,10 @@ impl Orchestrator {
                 continue;
             }
 
-            if needs_n {
+            // A 4xx on a ciphered URL is evidence about the cipher/PoToken, so heal. A 5xx (or no
+            // answer) is YouTube refusing for now: healing tears down the session PoToken, refetches
+            // the registries and rebuilds the webview for nothing, and the next client may well play.
+            if needs_n && probe.err().is_some_and(|s| !is_transient(s)) {
                 self.self_heal();
             }
         }
@@ -632,14 +660,17 @@ impl Orchestrator {
             }
         }
         tracing::info!(video_id, "all InnerTube clients exhausted → rustypipe fallback");
+        // One decision for both rustypipe arms: a sweep of 5xx with no 4xx is transient.
+        let only_5xx = transient && !hard;
         match rustypipe_fallback::resolve(video_id, prefer_high).await {
             Ok(c) if !self
                 .validate_stream(video_id, "rustypipe", &c.url, &HashMap::new(), Some(c.size))
-                .await =>
+                .await
+                .is_ok() =>
             {
                 tracing::warn!(video_id, "rustypipe URL serves only its first MiB, not playable");
                 // rustypipe answered, so the network is up and this failure is about the URL.
-                Err(nothing_played(video_id, logged_in, login_wanted, true))
+                Err(verdict(video_id, logged_in, login_wanted, true, only_5xx))
             }
             Ok(c) => Ok(PlaybackData {
                 video_id: video_id.to_owned(),
@@ -666,7 +697,7 @@ impl Orchestrator {
                 // MAIN/VISIONOS pair, or TVHTML5_SIMPLY passed over for want of a PoToken). Without
                 // this, a genuinely dead video reads as an outage and the queue sits on it.
                 let reached = reached || e.answered();
-                Err(nothing_played(video_id, logged_in, login_wanted, reached))
+                Err(verdict(video_id, logged_in, login_wanted, reached, only_5xx))
             }
         }
     }
@@ -794,6 +825,7 @@ impl Orchestrator {
                 content_length(format),
             )
             .await
+            .is_ok()
         {
             tracing::debug!(video_id, itag = format.itag, "video: WEB_REMIX URL refused");
             return None;
@@ -875,7 +907,12 @@ impl Orchestrator {
     /// `headers` is what `build` will hand mpv, so the probe carries exactly what the real fetch
     /// will (issue #71). Falls back to a HEAD when there is no length to aim at: an RSS-feed
     /// podcast's enclosure is not on googlevideo, reports `contentLength: "0"`, and may not honour
-    /// ranges at all (#294). Success = 2xx, false on any error.
+    /// ranges at all (#294).
+    ///
+    /// `Ok(())` is 2xx. `Err(status)` is the HTTP status, `Err(0)` a probe that never got an answer
+    /// (timeout or transport error). A 5xx is retried once after 500 ms, so a refused client can
+    /// cost up to ~20.5 s on the play path (two 10 s probes) instead of 10 s; a timeout is not
+    /// retried, since waiting longer for an unresponsive host only adds latency.
     async fn validate_stream(
         &self,
         video_id: &str,
@@ -883,32 +920,68 @@ impl Orchestrator {
         url: &str,
         headers: &HashMap<String, String>,
         content_length: Option<u64>,
-    ) -> bool {
-        let req = match content_length.filter(|n| *n > 0).filter(|_| is_youtube_stream(url)) {
-            Some(len) => crate::http::client()
-                .get(url)
-                .header("Range", format!("bytes={}-{}", len.saturating_sub(256), len - 1))
-                .header("Accept-Encoding", "identity"),
-            None => crate::http::client().head(url),
-        };
-        // The 10s budget is a property of this one probe, not of the app's HTTP.
-        let mut req = req.timeout(Duration::from_secs(10));
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        // A refusal here is invisible to the caller (it just `continue`s), which is why a dead
-        // stream URL used to look like "nothing loaded" with no line to explain it. context/06.
-        match req.send().await {
-            Ok(r) if r.status().is_success() => true,
-            Ok(r) => {
-                tracing::warn!(video_id, client, status = %r.status(), "stream validation refused");
-                false
+    ) -> Result<(), u16> {
+        let mut status = 0u16;
+        let total = Instant::now();
+        for attempt in 0..2 {
+            let started = Instant::now();
+            let req = match content_length.filter(|n| *n > 0).filter(|_| is_youtube_stream(url)) {
+                Some(len) => crate::http::client()
+                    .get(url)
+                    .header("Range", format!("bytes={}-{}", len.saturating_sub(256), len - 1))
+                    .header("Accept-Encoding", "identity"),
+                None => crate::http::client().head(url),
+            };
+            // The 10s budget is a property of this one probe, not of the app's HTTP.
+            let mut req = req.timeout(Duration::from_secs(10));
+            for (k, v) in headers {
+                req = req.header(k, v);
             }
-            Err(e) => {
-                tracing::warn!(video_id, client, error = %e, "stream validation failed");
-                false
+            match req.send().await {
+                Ok(r) if r.status().is_success() => return Ok(()),
+                Ok(r) => {
+                    status = r.status().as_u16();
+                    if !r.status().is_server_error() {
+                        tracing::warn!(
+                            video_id,
+                            client,
+                            status = %r.status(),
+                            attempt,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "stream validation refused"
+                        );
+                        return Err(status);
+                    }
+                }
+                Err(e) => {
+                    // 0 stands for "the probe never got an answer" — a timeout or a transport
+                    // error, which the caller treats as transient like a 5xx.
+                    tracing::warn!(
+                        video_id,
+                        client,
+                        attempt,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        error = %e,
+                        "stream validation failed"
+                    );
+                    return Err(0);
+                }
+            }
+            // A 5xx is often a momentary refusal: one retry a moment later is cheap, and without it
+            // a blip costs the row (the caller drops what no client could validate).
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+        tracing::warn!(
+            video_id,
+            client,
+            status,
+            attempts = 2,
+            elapsed_ms = total.elapsed().as_millis(),
+            "stream validation refused"
+        );
+        Err(status)
     }
 
     /// A live playlist is text with no length, so the ranged probe above has nothing to ask for:
@@ -1076,6 +1149,33 @@ fn nothing_played(
     }
 }
 
+/// The final error when nothing played.
+///
+/// `only_5xx` is "every InnerTube probe failed with a 5xx or never answered, and none answered
+/// with a 4xx": YouTube refusing for now, not a verdict on the track, so the row must survive for
+/// a later play. A 4xx anywhere keeps the old verdicts — that is a real "this track is refused".
+///
+/// rustypipe's probe status is deliberately not part of that decision: its 403 is the known
+/// first-MiB limit, not a verdict on the track (see the fallback call site).
+fn verdict(
+    video_id: &str,
+    logged_in: bool,
+    login_wanted: bool,
+    reached: bool,
+    only_5xx: bool,
+) -> ResolveError {
+    if only_5xx {
+        return ResolveError::Transient(video_id.to_owned());
+    }
+    nothing_played(video_id, logged_in, login_wanted, reached)
+}
+
+/// A probe status the caller should read as "YouTube refuses for now" rather than a verdict on the
+/// track: no answer at all (0), or a 5xx. A 4xx is a verdict.
+fn is_transient(status: u16) -> bool {
+    status == 0 || status >= 500
+}
+
 fn is_high(f: &Format) -> bool {
     f.audio_quality.as_deref() == Some("AUDIO_QUALITY_HIGH")
 }
@@ -1126,7 +1226,8 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 mod tests {
     use super::{
         blacklist_blocks, blacklist_insert, claim_heal, content_length, is_youtube_stream,
-        nothing_played, stream_headers, with_pot, ResolveError, WEB_REMIX_BLACKLIST_TTL,
+        is_transient, nothing_played, stream_headers, verdict, with_pot, ResolveError,
+        WEB_REMIX_BLACKLIST_TTL,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -1241,8 +1342,24 @@ mod tests {
             "every anonymous track fails the same way until the user signs in"
         );
         assert!(
+            !ResolveError::Transient(v()).affects_every_track(),
+            "a 5xx is not a verdict on the track: start_current skips it (bounded)"
+        );
+        assert!(
+            ResolveError::Transient(v()).keeps_row(),
+            "but the lookahead must not delete the row"
+        );
+        assert!(
+            ResolveError::Unreachable(v()).keeps_row(),
+            "an outage must not delete rows either"
+        );
+        assert!(
             !ResolveError::AllClientsFailed(v()).affects_every_track(),
             "an unavailable video must still be skipped, or the queue stalls on it"
+        );
+        assert!(
+            !ResolveError::AllClientsFailed(v()).keeps_row(),
+            "a real refusal is a verdict: the row can go"
         );
         assert!(
             !ResolveError::UploadUnavailable(v()).affects_every_track(),
@@ -1252,6 +1369,42 @@ mod tests {
             !ResolveError::LocalMissing(v()).affects_every_track(),
             "a deleted local file must keep leaving the queue"
         );
+    }
+
+    #[test]
+    fn a_5xx_only_sweep_keeps_the_row() {
+        // Live case: WEB_REMIX/VISIONOS/TVHTML5_SIMPLY all answered 503 and the row was dropped.
+        let e = verdict("v", true, false, true, true);
+        assert!(matches!(e, ResolveError::Transient(_)));
+    }
+
+    #[test]
+    fn probe_status_boundaries() {
+        assert!(is_transient(0), "no answer at all is not a verdict");
+        assert!(!is_transient(403), "a 403 is a verdict");
+        assert!(!is_transient(499));
+        assert!(is_transient(500));
+        assert!(is_transient(503));
+    }
+
+    #[test]
+    fn one_hard_refusal_still_reads_as_a_verdict() {
+        // A 403 from any InnerTube client means the track really is refused, 503s or not.
+        let e = verdict("v", true, false, true, false);
+        assert!(matches!(e, ResolveError::AllClientsFailed(_)));
+        assert!(!e.affects_every_track());
+    }
+
+    #[test]
+    fn nothing_transient_falls_back_to_the_old_verdicts() {
+        assert!(matches!(
+            verdict("v", false, true, true, false),
+            ResolveError::SignInRequired(_)
+        ));
+        assert!(matches!(
+            verdict("v", true, false, false, false),
+            ResolveError::Unreachable(_)
+        ));
     }
 
     #[test]
